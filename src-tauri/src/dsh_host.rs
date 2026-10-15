@@ -1204,6 +1204,53 @@ mod tests {
         assert_eq!(loggable_line(mentions), mentions);
     }
 
+    /// 真实 drain 路径的唯一端到端断言：ring 必须留下启动令牌（就绪循环要从内存
+    /// 里再取一次），而磁盘日志必须一个字节都拿不到它——宿主被中途杀掉时，日志
+    /// 是唯一幸存的产物，它得能直接交给别人看。
+    #[tokio::test]
+    async fn ring_drain_keeps_the_token_in_memory_and_out_of_the_log() {
+        use tokio::io::AsyncWriteExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "ccgui-next-host-log-drain-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = HostLog::path_for(&home, SystemTime::now()).unwrap();
+        let log = HostLog::open(path.clone());
+        let buf = Arc::new(Mutex::new(String::new()));
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        spawn_ring_drain(reader, buf.clone(), None, Some(log));
+        writer
+            .write_all(b"dsh web: http://127.0.0.1:3080/?token=AbC-123_xyz\n")
+            .await
+            .unwrap();
+        writer
+            .write_all(b"ready on http://127.0.0.1:3080\n")
+            .await
+            .unwrap();
+        drop(writer); // EOF ends the drain loop.
+
+        // Wait for the drain task to see EOF and flush the second line.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut logged = String::new();
+        loop {
+            logged = std::fs::read_to_string(&path).unwrap_or_default();
+            if logged.contains("ready on") || Instant::now() > deadline {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let ring = ring_snapshot(&buf);
+        assert!(ring.contains("token=AbC-123_xyz"), "{ring}");
+        assert!(ring.contains("ready on"), "{ring}");
+        assert!(logged.contains("ready on"), "{logged}");
+        assert!(logged.contains("[redacted] launch token line"), "{logged}");
+        assert!(!logged.contains("AbC-123_xyz"), "{logged}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn origin_locality_is_detected_from_the_configured_origin() {
         for origin in [
