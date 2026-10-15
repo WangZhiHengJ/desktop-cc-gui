@@ -294,6 +294,8 @@ export const en: Messages = {
     todoPill: "Tasks",
     todoStatusPending: "Pending",
     todoStatusBlocked: "Blocked",
+    todoStatusInProgress: "In progress",
+    todoStatusUnknown: "Unknown status",
     editedPill: "Edited",
     runStatusExpand: "Expand run status",
     runStatusCollapse: "Collapse run status",

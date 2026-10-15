@@ -198,17 +198,27 @@ pub struct TodosPayload {
     pub items: Vec<TodoItem>,
     pub replace: bool,
 }
-/// Normalize a CLI's todo status onto the four the UI renders. Every CLI
+/// Normalize a CLI's todo status onto the words the UI renders. Every CLI
 /// spells these differently (claude `in_progress`, omp `running`/`active`,
-/// `abandoned` for a dropped task), and a status the UI does not know reads
-/// as "pending" - showing finished or abandoned work as still to do.
+/// `abandoned` for a dropped task), so trim and case are folded here:
+/// `"Completed"` or `" in_progress"` used to fall through to `pending`, which
+/// showed finished or in-flight work as still to do.
+///
+/// A word this vocabulary does not know becomes `unknown` instead of a silent
+/// `pending`: the UI must not assert a task has not started when all it has is
+/// an unreadable status. An absent/blank status stays `pending` — that is the
+/// shape of a list that simply carries no status (omp's `list.items`).
 fn todo_status(raw: Option<&str>) -> &'static str {
-    match raw.unwrap_or("") {
-        "in_progress" | "running" | "active" => "active",
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return "pending";
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "pending" => "pending",
+        "in_progress" | "in-progress" | "running" | "active" => "active",
         "completed" | "complete" | "done" => "complete",
         "blocked" => "blocked",
-        "dropped" | "cancelled" | "abandoned" | "deleted" => "dropped",
-        _ => "pending",
+        "dropped" | "cancelled" | "canceled" | "abandoned" | "deleted" => "dropped",
+        _ => "unknown",
     }
 }
 /// Drop empty / null payloads so the UI does not render a blank args panel.
@@ -627,6 +637,51 @@ mod tool_args_tests {
         assert_eq!(
             parse_tool_args_value(&json!("plain command")),
             Some(json!("plain command"))
+        );
+    }
+
+    /// A status word in another shape is the same word: before folding trim and
+    /// case, `"Completed"` / `" in_progress"` fell through to `pending`, so the
+    /// panel reported finished or in-flight work as still to do. A word this
+    /// vocabulary does not know now says so instead of asserting the task has
+    /// not started; an absent status stays `pending` (a list with no statuses).
+    #[test]
+    fn todo_status_folds_case_and_reports_unreadable_words() {
+        assert_eq!(todo_status(Some("pending")), "pending");
+        assert_eq!(todo_status(Some("Completed")), "complete");
+        assert_eq!(todo_status(Some("  in_progress ")), "active");
+        assert_eq!(todo_status(Some("In-Progress")), "active");
+        assert_eq!(todo_status(Some("CANCELED")), "dropped");
+        assert_eq!(todo_status(None), "pending");
+        assert_eq!(todo_status(Some("   ")), "pending");
+        assert_eq!(todo_status(Some("paused")), "unknown");
+    }
+
+    /// DSH's todo tool sends the whole list as `{todos:[{content,status}]}`;
+    /// that is the list the run-status panel renders for this engine.
+    #[test]
+    fn parse_todo_args_keeps_dsh_statuses() {
+        let payload = parse_todo_args(&json!({
+            "todos": [
+                {"content": "scan files", "status": "completed"},
+                {"content": "write code", "status": "in_progress"},
+                {"content": "unreadable", "status": "paused"},
+            ]
+        }))
+        .expect("a dsh todo payload");
+        assert!(payload.replace);
+        let seen: Vec<(&str, &str)> = payload
+            .items
+            .iter()
+            .map(|item| (item.content.as_str(), item.status.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("scan files", "complete"),
+                ("write code", "active"),
+                ("unreadable", "unknown"),
+            ]
         );
     }
 

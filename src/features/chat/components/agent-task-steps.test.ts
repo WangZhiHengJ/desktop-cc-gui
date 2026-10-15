@@ -370,4 +370,32 @@ describe("subagent counting", () => {
     const items = deriveTodoList(messages);
     expect(items).toEqual([{ content: "实现功能", status: "complete", phase: "impl", reason: undefined, detail: undefined }]);
   });
+
+  it("keeps an unreadable status word readable instead of calling it pending", () => {
+    // The panel reported "待处理" for every status it could not parse, which
+    // claims the task has not started; "paused" says nothing of the sort. The
+    // same word in another case ("Completed") is not a different status.
+    const messages: Message[] = [
+      tool(1, "todo", { op: "init" }, undefined),
+      tool(2, "todo", { op: "done" }, {
+        details: {
+          phases: [
+            {
+              name: "impl",
+              tasks: [
+                { content: "大写完成", status: "Completed" },
+                { content: "读不懂", status: "paused" },
+                { content: "没有状态" },
+              ],
+            },
+          ],
+        },
+      }),
+    ];
+    expect(deriveTodoList(messages).map(({ content, status }) => ({ content, status }))).toEqual([
+      { content: "大写完成", status: "complete" },
+      { content: "读不懂", status: "unknown" },
+      { content: "没有状态", status: "pending" },
+    ]);
+  });
 });

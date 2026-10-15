@@ -87,6 +87,7 @@
 - **异步动作进行中不可重入**：进行中禁用按钮（或首行拦截 `if (running) return`），避免重复请求。
 - **反馈不改变布局**：图标在默认态与反馈态之间切换时，外层容器尺寸固定（`ActionFeedbackIcon` 用 `iconClassName` 同时约束容器和图标），按钮不能因为换图标而抖动。
 - **动效可降级**：过渡类一律带 `motion-reduce:transition-none`；关键帧动画的降级见 [§8](#8-待收敛)。
+- **同一条目的不同状态不许合并成一个词**：运行状态面板里「任务」胶囊展开后的每行状态、以及点进单条后的「执行情况」，必须把三件事分开表达——未开始（`pending` → 待处理）、已在进行（引擎报 `in_progress`/`running`/`active` → 进行中；只有本轮确实在流式时才用「运行中」，静止不等于退回未开始）、状态词读不懂（`unknown` → 状态未知）。把「进行中但本轮已静止」或「认不出的状态词」显示成「待处理」，等于告诉用户活儿还没开始，与实际相反。后端 `src-tauri/src/engine/events.rs` 的 `todo_status` 是归一化的唯一点：先去掉首尾空白再折大小写（`"Completed"`、`" in_progress"`、`"in-progress"` 都是同一个词），认不出的词返回 `unknown` 而不是静默当作 `pending`；前端 `agent-task-steps.ts` 的解析与 `RunStatusStrip.tsx` 的文案 / 色调按同一张词表渲染。回归：`RunStatusStrip.test.tsx`、`agent-task-steps.test.ts`、Rust `engine::events::tool_args_tests`。
 - **同一状态只表达一次**：列表行里「已安装 / 可更新」只给一个信号——市场表的右侧按钮就是该行的状态（`安装` → `更新至 vX` → `已安装`），行内不再重复挂徽标；安装中按钮原地换成进度（`plugins.installingPct`）且保持占位不變（`PluginMarketRow.tsx`）。
 - **表格化列表**：插件市场用语义 `<table>` + `table-fixed`，列头是唯一的字段说明（名称 / 开发者 / 安装量 / 版本 / 操作）；整列无数据时整列不渲染（`PluginMarketView` 的 `showDownloads`），不用一列「—」占位。开发者列的头像是该账号的真实 GitHub 头像（`githubAvatarUrl`），加载中或取不到时回落到同一配色的首字母瓷砖，不出现破图。
 - **官方身份用紫色品牌徽标，工具栏下拉同时承担人群范围**：市场表开发者列在 `githubLoginFor` 解析出的账号等于官方账号时（`isOfficialPlugin`，账号 `zhukunpenglinyutong`，author 或 repo owner，大小写不敏感），整格只渲染紫色「CCGUI官方插件」徽标（`status-purple-background` / `status-purple-text`；紫色专属官方，不与中性类型徽标、lime「已安装」混用）——官方插件的账号是隐含信息，不再重复头像与（被截断的）用户名；详情页右栏 `AuthorChip` 同一条判定，徽标整块是按钮（`title` 报出目标主页），点击打开该官方账号主页，第三方插件才展示可点的头像+名称。工具栏下拉（`sortLabel`）语义混合：`综合排序` / `下载量` 显示全部、只是排序不同；`CCGUI官方插件` / `社区插件` 只保留该类并按下载量排序（`sortPlugins` 内 `pluginMatchesAudience`）。空状态的「清除筛选」要把下拉一并复位回 `综合排序`。
@@ -296,6 +297,7 @@ const feedback = useRunningFeedback(store.loading);
 
 | 版本 | 时间 | 内容 |
 |---|---|---|
+| v0.85 | 2026-10-18 | 「任务」胶囊的状态不再把三种含义合并成「待处理」：未开始 / 进行中 / 状态读不懂各有自己的词与色调，「进行中但本轮已静止」不再退回「待处理」，详情里的「执行情况」与列表同一字段；后端 todo 状态归一化补上首尾空白与大小写折叠（`Completed`、` in_progress`、`in-progress` 都是同一个词），认不出的状态词返回 `unknown` 而非静默当作未开始；§3 补规则 |
 | v0.84 | 2026-10-16 | 字体设置新增独立「自定义字体族」分类（仅占位示例），保留上传分类；统一聊天代码、编辑器、差异视图和终端的代码字体/字号，补齐字体加载后量度与 PTY 尺寸同步；§2、§3 更新 |
 | v0.83 | 2026-10-10 | 首启缺前提的三个表面统一：①「新建会话」在零工作区时登记目录后**接着开出待发会话**（`use-chat-sidebar.ts` 的 `handleAddWorkspace` 返回选中路径，`handleNewSession` 链式 `startNewChat`，与 worktree 创建完成的既有范式一致；取消选择不留空标签页）；②发送键的「前置条件未满足」禁用改为 `aria-disabled` + 点击守卫 + 解释性 tooltip（`Composer` / `ComposerToolbar` 新增 `disabledReason`，原生 `disabled` 收不到 hover 读不到提示）；③空态按前提分流（零工作区说「还没有工作区，请先在侧栏添加」+ 下一步指引，有工作区无会话才说「选择或新建一个会话开始」）；④无归属草稿（`drafts[""]`，新增 `UNBOUND_DRAFT_KEY`）在第一个会话建立时搬到该会话键上并清空键（只搬一次、不覆盖目标已有草稿），同一状态下输入框占位提示改口说明缺什么。另修 Claude 的 1M 变体后缀：`<家族>[1m]` 命中 `ANTHROPIC_DEFAULT_<家族>_MODEL` 时，启动模型与 `comparisonModel` 都保留后缀（与渠道侧 `claude_channel` 的既有行为对齐）；DSH 驱动读取 `request/context` 的 `contextWindow`（模型目录与 TokenUsage 都不带窗口），usage 与回合结束载荷带上真实窗口，用量环不再回落 200k 假定值。§3 补规则 |
 | v0.82 | 2026-10-10 | 输入框支持粘贴文件：从 Finder / Explorer 复制的文件与拖拽同一条路由（图片成附件，其他文件变 `@path` 引用），新增 `clipboard_file_paths` 原生探测（macOS NSPasteboard file URL / Windows CF_HDROP），事件自带 `text/uri-list` 时兜底；截图字节管线与纯文本粘贴行为不变；§3 补规则 |

@@ -502,14 +502,31 @@ function parseTodoFromResult(result: unknown): TodosPayload | null {
       const content = typeof t.content === "string" ? t.content.trim() : "";
       if (!content) continue;
       const rawStatus = typeof t.status === "string" ? t.status.trim().toLowerCase() : "";
-      let status: TodoItem["status"] = "pending";
-      if (rawStatus === "completed" || rawStatus === "complete" || rawStatus === "done") {
+      // Mirror the backend vocabulary (events.rs `todo_status`): the same word
+      // in another spelling must not fall through, and a word this UI cannot
+      // read becomes `unknown` rather than a false "pending" — claiming a task
+      // has not started when its status is merely unreadable misleads the user
+      // about whether work is still to come.
+      let status: TodoItem["status"] = rawStatus === "" ? "pending" : "unknown";
+      if (rawStatus === "pending") {
+        status = "pending";
+      } else if (rawStatus === "completed" || rawStatus === "complete" || rawStatus === "done") {
         status = "complete";
-      } else if (rawStatus === "in_progress" || rawStatus === "active" || rawStatus === "running") {
+      } else if (
+        rawStatus === "in_progress" ||
+        rawStatus === "in-progress" ||
+        rawStatus === "active" ||
+        rawStatus === "running"
+      ) {
         status = "active";
       } else if (rawStatus === "blocked") {
         status = "blocked";
-      } else if (rawStatus === "abandoned" || rawStatus === "dropped") {
+      } else if (
+        rawStatus === "abandoned" ||
+        rawStatus === "dropped" ||
+        rawStatus === "cancelled" ||
+        rawStatus === "canceled"
+      ) {
         status = "dropped";
       }
       const reason = typeof t.blocker === "string" ? t.blocker.trim() : typeof t.reason === "string" ? t.reason.trim() : undefined;
