@@ -84,6 +84,7 @@
 - **异步动作进行中不可重入**：进行中禁用按钮（或首行拦截 `if (running) return`），避免重复请求。
 - **反馈不改变布局**：图标在默认态与反馈态之间切换时，外层容器尺寸固定（`ActionFeedbackIcon` 用 `iconClassName` 同时约束容器和图标），按钮不能因为换图标而抖动。
 - **动效可降级**：过渡类一律带 `motion-reduce:transition-none`；关键帧动画的降级见 [§8](#8-待收敛)。
+- **同一条目的不同状态不许合并成一个词**：运行状态面板里「任务」胶囊展开后的每行状态、以及点进单条后的「执行情况」，必须把三件事分开表达——未开始（`pending` → 待处理）、已在进行（引擎报 `in_progress`/`running`/`active` → 进行中；只有本轮确实在流式时才用「运行中」，静止不等于退回未开始）、状态词读不懂（`unknown` → 状态未知）。把「进行中但本轮已静止」或「认不出的状态词」显示成「待处理」，等于告诉用户活儿还没开始，与实际相反。后端 `src-tauri/src/engine/events.rs` 的 `todo_status` 是归一化的唯一点：先去掉首尾空白再折大小写（`"Completed"`、`" in_progress"`、`"in-progress"` 都是同一个词），认不出的词返回 `unknown` 而不是静默当作 `pending`；前端 `agent-task-steps.ts` 的解析与 `RunStatusStrip.tsx` 的文案 / 色调按同一张词表渲染。回归：`RunStatusStrip.test.tsx`、`agent-task-steps.test.ts`、Rust `engine::events::tool_args_tests`。
 - **同一状态只表达一次**：列表行里「已安装 / 可更新」只给一个信号——市场表的右侧按钮就是该行的状态（`安装` → `更新至 vX` → `已安装`），行内不再重复挂徽标；安装中按钮原地换成进度（`plugins.installingPct`）且保持占位不變（`PluginMarketRow.tsx`）。
 - **表格化列表**：插件市场用语义 `<table>` + `table-fixed`，列头是唯一的字段说明（名称 / 开发者 / 安装量 / 版本 / 操作）；整列无数据时整列不渲染（`PluginMarketView` 的 `showDownloads`），不用一列「—」占位。开发者列的头像是该账号的真实 GitHub 头像（`githubAvatarUrl`），加载中或取不到时回落到同一配色的首字母瓷砖，不出现破图。
 - **官方身份用紫色品牌徽标，工具栏下拉同时承担人群范围**：市场表开发者列在 `githubLoginFor` 解析出的账号等于官方账号时（`isOfficialPlugin`，账号 `zhukunpenglinyutong`，author 或 repo owner，大小写不敏感），整格只渲染紫色「CCGUI官方插件」徽标（`status-purple-background` / `status-purple-text`；紫色专属官方，不与中性类型徽标、lime「已安装」混用）——官方插件的账号是隐含信息，不再重复头像与（被截断的）用户名；详情页右栏 `AuthorChip` 同一条判定，徽标整块是按钮（`title` 报出目标主页），点击打开该官方账号主页，第三方插件才展示可点的头像+名称。工具栏下拉（`sortLabel`）语义混合：`综合排序` / `下载量` 显示全部、只是排序不同；`CCGUI官方插件` / `社区插件` 只保留该类并按下载量排序（`sortPlugins` 内 `pluginMatchesAudience`）。空状态的「清除筛选」要把下拉一并复位回 `综合排序`。
@@ -293,6 +294,7 @@ const feedback = useRunningFeedback(store.loading);
 
 | 版本 | 时间 | 内容 |
 |---|---|---|
+| v0.84 | 2026-10-15 | 「任务」胶囊的状态不再把三种含义合并成「待处理」：未开始 / 进行中 / 状态读不懂各有自己的词与色调，「进行中但本轮已静止」不再退回「待处理」，详情里的「执行情况」与列表同一字段；后端 todo 状态归一化补上首尾空白与大小写折叠（`Completed`、` in_progress`、`in-progress` 都是同一个词），认不出的状态词返回 `unknown` 而非静默当作未开始；§3 补规则 |
 | v0.82 | 2026-10-10 | 输入框支持粘贴文件：从 Finder / Explorer 复制的文件与拖拽同一条路由（图片成附件，其他文件变 `@path` 引用），新增 `clipboard_file_paths` 原生探测（macOS NSPasteboard file URL / Windows CF_HDROP），事件自带 `text/uri-list` 时兜底；截图字节管线与纯文本粘贴行为不变；§3 补规则 |
 | v0.81 | 2026-10-09 | 聊天输入框取消选字后 100ms 回车保护窗，改按组合输入状态和 IME 键码区分确认与发送；修复快速中文选字后回车意外换行，保留换行快捷键并隔离补全菜单、历史召回；开始中文编辑时退出历史导航，避免选字后方向键覆盖新草稿。新增设置 → 通用 → 外观「宽幕布」开关（默认关，`AppSettings.chatWideLayout`）：聊天内容轨道（时间线 / 输入框 / 状态栏 / 附件行 / 队列 / 提问与计划 dock）默认保持原样的居中 750px / `max-w-3xl` 宽度，打开后去掉上限占满窗格、只留 16px 内边距；宽度单点在 `chat-column.ts`，开关经 chat store 即时生效并随设置持久化（重启保留）；§3 补规则 |
 | v0.80 | 2026-10-08 | 插件市场首屏新增**编辑精选轮播**（方案 A）：数据走索引仓新增的 `featured.json`（后端 `plugin_fetch_featured`，与索引共用 1h 缓存且串行调用以复用同一次索引拉取；id 不在索引 / 重复 / 超 8 条由后端与索引仓 `validate.mjs` 双重拦下）。市场行与轮播共用抽出的 `MarketActionButton`，两处安装/更新/已安装状态永不打架。自动播放由进度条关键帧驱动（悬停 / 焦点 / 后台 / reduced-motion 同点冻结），封面按「编辑封面 → 插件截图（原比例）→ icon → 品牌首字块」四级回落，缺图不留空洞；`plugin_fetch_featured` 同时进 web 只读白名单；§3 补规则、§7 登记刷新范围 |

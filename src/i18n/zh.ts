@@ -274,6 +274,8 @@ export const zh = {
     todoPill: "任务",
     todoStatusPending: "待处理",
     todoStatusBlocked: "已阻塞",
+    todoStatusInProgress: "进行中",
+    todoStatusUnknown: "状态未知",
     editedPill: "已编辑",
     runStatusExpand: "展开运行状态",
     runStatusCollapse: "收起运行状态",

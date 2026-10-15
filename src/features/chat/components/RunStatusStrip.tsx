@@ -290,17 +290,24 @@ function TodoStatusGlyph({
   return wrap ? <span className="grid size-3.5 place-items-center">{glyph}</span> : glyph;
 }
 
-/** Status label for the todo list and detail header; `live` decides whether an
- *  active row reads "running" or is still waiting. */
+/** Status label for the todo list and detail header. Three facts must stay
+ *  distinguishable: not started (`pending`), in flight (`active` — `live` only
+ *  adds that tokens are flowing right now, not that the task stopped being in
+ *  progress), and a status word this UI cannot read (`unknown`). Collapsing any
+ *  of them into "pending" told the user work was still to come when it was
+ *  already running or already finished. */
 function todoStatusLabel(
   t: TFunction,
   status: TodoItem["status"],
   live: boolean,
 ): string {
   if (status === "complete") return t("chat.agentStatusDone");
-  if (status === "active") return live ? t("chat.agentStatusRunning") : t("chat.todoStatusPending");
+  if (status === "active") {
+    return live ? t("chat.agentStatusRunning") : t("chat.todoStatusInProgress");
+  }
   if (status === "blocked") return t("chat.todoStatusBlocked");
   if (status === "dropped") return "";
+  if (status === "unknown") return t("chat.todoStatusUnknown");
   return t("chat.todoStatusPending");
 }
 
@@ -309,6 +316,7 @@ function todoStatusTone(status: TodoItem["status"], live: boolean): string {
   if (status === "complete") return "text-[var(--color-status-unseen)]";
   if (status === "blocked") return "text-text-error-primary";
   if (status === "active" && live) return "text-blue-500";
+  if (status === "unknown") return "text-text-tertiary";
   return "text-text-secondary";
 }
 
@@ -441,9 +449,10 @@ function TodoRows({ items, live }: { items: TodoItem[]; live: boolean }) {
 
   const statusText: Record<TodoItem["status"], string> = {
     pending: t("chat.todoStatusPending"),
-    active: live ? t("chat.agentStatusRunning") : t("chat.todoStatusPending"),
+    active: live ? t("chat.agentStatusRunning") : t("chat.todoStatusInProgress"),
     complete: t("chat.agentStatusDone"),
     blocked: t("chat.todoStatusBlocked"),
+    unknown: t("chat.todoStatusUnknown"),
     dropped: "",
   };
   return (

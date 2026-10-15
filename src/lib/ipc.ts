@@ -35,7 +35,10 @@ export interface SessionMeta {
   provider?: string | null;
 }
 
-export type TodoStatus = "pending" | "active" | "complete" | "blocked" | "dropped";
+/** `unknown` is a status whose word the engine used but this UI cannot read:
+ *  it must not be rendered as "pending", which would claim the task has not
+ *  started. */
+export type TodoStatus = "pending" | "active" | "complete" | "blocked" | "dropped" | "unknown";
 
 export interface TodoItem {
   id?: string | null;

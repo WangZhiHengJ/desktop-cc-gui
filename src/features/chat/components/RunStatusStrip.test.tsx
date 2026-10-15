@@ -564,11 +564,52 @@ describe("RunStatusStrip", () => {
     expect(pill("子代理").textContent).toContain("3/4");
     expect(container.querySelector(".animate-ping")).toBeNull();
 
-    // Inside panel: when not live, active item displays 待处理 instead of 运行中
+    // Inside panel: when not live, an in-flight item must not read 待处理.
+    // "still to do" and "in progress but momentarily quiet" are different
+    // facts; collapsing them told the user work was yet to come.
     await click(pill("任务"));
     const todoPanel = container.querySelector("[data-testid='run-status-todos']")?.textContent;
-    expect(todoPanel).toContain("待处理");
+    expect(todoPanel).toContain("进行中");
+    expect(todoPanel).not.toContain("待处理");
     expect(todoPanel).not.toContain("运行中");
+  });
+
+  it("tells not-started, in-flight and unreadable task states apart", async () => {
+    const messages: Message[] = [
+      msg(1, "user", "plan the work"),
+      todoMsg(2, {
+        replace: true,
+        items: [
+          { content: "还没开始", status: "pending" },
+          { content: "正在做", status: "active" },
+          { content: "做完了", status: "complete" },
+          { content: "读不懂", status: "unknown" },
+        ],
+      }),
+    ];
+    seed(messages, false);
+    await renderStrip();
+    await click(pill("任务"));
+
+    const rowText = (key: string) =>
+      container.querySelector(`[data-todo-item-key="${key}"]`)?.textContent ?? "";
+    // Row by row: the word must describe that row's own state. Not streaming,
+    // so the in-flight task reads 进行中 — never 待处理 (not started) and never
+    // 运行中 (which would claim tokens are flowing right now).
+    expect(rowText("还没开始")).toContain("待处理");
+    expect(rowText("正在做")).toContain("进行中");
+    expect(rowText("正在做")).not.toContain("待处理");
+    expect(rowText("正在做")).not.toContain("运行中");
+    expect(rowText("做完了")).toContain("已完成");
+    // A status word the UI cannot read admits it instead of posing as pending.
+    expect(rowText("读不懂")).toContain("状态未知");
+    expect(rowText("读不懂")).not.toContain("待处理");
+
+    // The detail overlay (where the user reads 执行情况) agrees with the row.
+    await click(container.querySelector('[data-todo-item-key="读不懂"]')!);
+    const detail = container.querySelector("[data-testid='run-status-todos']")?.textContent ?? "";
+    expect(detail).toContain("状态未知");
+    expect(detail).not.toContain("待处理");
   });
 
   it("reads completed todo snapshot from message.result without pre-set message.todos", async () => {
