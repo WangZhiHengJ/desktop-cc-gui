@@ -179,10 +179,18 @@ impl CliModelConfig {
     /// The CLI's effective default model id: env.ANTHROPIC_MODEL beats the
     /// `model` key (the CLI applies settings env as real environment
     /// variables); a bare family alias there resolves through its override.
+    /// A `[1m]` suffix on the raw default survives the override, the same
+    /// contract as the launch selector — otherwise the "default" route
+    /// would silently downgrade a 1M pick.
     fn resolved_default(&self) -> Option<String> {
         let raw = self.env_model.as_deref().or(self.model_key.as_deref())?;
         let family = raw.strip_suffix("[1m]").unwrap_or(raw);
-        Some(self.override_for(family).unwrap_or(raw).to_string())
+        let resolved = self.override_for(family).unwrap_or(raw);
+        Some(if family.len() != raw.len() && !resolved.ends_with("[1m]") {
+            format!("{resolved}[1m]")
+        } else {
+            resolved.to_string()
+        })
     }
 }
 
@@ -567,7 +575,19 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        assert_eq!(config.resolved_default().as_deref(), Some("grok-4.5"));
+        // 默认模型写成 `<family>[1m]` 且命中覆盖：后缀跟到映射值上，
+        // 与 resolve_launch_model_from 的选择器路径同一条约定。
+        assert_eq!(config.resolved_default().as_deref(), Some("grok-4.5[1m]"));
+        // 覆盖值自带 `[1m]` 时不叠双后缀。
+        let config = CliModelConfig {
+            provider_flags: Default::default(),
+            env_model: None,
+            model_key: Some("opus[1m]".to_string()),
+            overrides: [("opus".to_string(), "grok-4.5[1m]".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(config.resolved_default().as_deref(), Some("grok-4.5[1m]"));
         // A raw id passes through untouched.
         let config = CliModelConfig {
             env_model: Some("k3".to_string()),

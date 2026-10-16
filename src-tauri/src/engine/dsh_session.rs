@@ -599,12 +599,12 @@ fn handle_session_event(
         "plan/mode" => {}
         // 请求上下文：DSH 在这里通告本次请求的真实窗口（provider/model/
         // contextWindow），是已发布事件里唯一的窗口来源——TokenUsage 与
-        // session/modelCatalog 都不带窗口。缓存下来供本轮 usage/done 补窗口；
-        // 丢掉它前端就只剩 200k 假定值（mify 的 1M 模型因此显示成 200k）。
+        // session/modelCatalog 都不带窗口。按请求配对：每个通告都覆盖缓存
+        // （不带窗口的通告清掉上一请求的值，窗口不会错配给下一个请求），
+        // 供本轮 usage/done 补窗口；丢掉它前端就只剩 200k 假定值（mify 的
+        // 1M 模型因此显示成 200k）。
         "request/context" => {
-            if let Some(window) = context_window_of(data) {
-                view.context_window = Some(window);
-            }
+            view.context_window = context_window_of(data);
         }
         _ => {} // user/message / step/* / system/message / title: UI noise here
     }
@@ -1933,10 +1933,59 @@ mod tests {
             Some(1_000_000),
             "the window announced by request/context must reach the usage event: {usage}"
         );
+    }
+
+    /// Windows pair per request: a `request/context` without a window clears
+    /// the previous announcement instead of lending it to the next request
+    /// (e.g. a subagent on a different model mid-turn).
+    #[tokio::test]
+    async fn request_context_without_window_clears_the_previous_one() {
+        let (core, _registry, emitter) = test_core();
+        let mut state = TurnState::new(None);
+        let mut view = TurnView::default();
+
+        handle_session_event(
+            &core,
+            &mut state,
+            &mut view,
+            "request/context",
+            &json!({ "provider": "mify", "model": "m", "contextWindow": 1_000_000 }),
+        );
+        // The next request announces no window: the cached 1M must not leak.
+        handle_session_event(
+            &core,
+            &mut state,
+            &mut view,
+            "request/context",
+            &json!({ "provider": "mify", "model": "m-small" }),
+        );
+        handle_assistant_stream(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "type": "assistant-stream",
+                "frame": {
+                    "type": "chunk",
+                    "chunk": {
+                        "type": "usage",
+                        "usage": { "inputTokens": 100, "outputTokens": 5 }
+                    }
+                }
+            }),
+        );
+        core.sink.flush();
+
+        let events = emitter.0.lock().unwrap().clone();
+        let usage = collect_kinds(&events)
+            .into_iter()
+            .find(|(kind, _)| kind == "usage")
+            .map(|(_, data)| data)
+            .expect("a usage event must be emitted for the chunk");
         assert_eq!(
-            usage.get("inputTokens").and_then(Value::as_i64),
-            Some(900_000),
-            "token counters must survive the window attach: {usage}"
+            usage.get("model_context_window"),
+            None,
+            "a window-less request/context must clear the cached window: {usage}"
         );
     }
 
