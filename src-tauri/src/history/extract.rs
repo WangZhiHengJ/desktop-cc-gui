@@ -228,24 +228,30 @@ fn walk_lines(
 /// （文件末尾从不是某条消息的起点）。
 ///
 /// 存在的理由：切点只能从**解析器同一条**流水线上推导。另写一份"这条原始记录
-/// 算不算用户消息"的判据必然与提取器分家（本地命令窗口的 stdout、skill 命令
-/// 信封、纯图片轮三处各有偏差），于是"第 n 条 user 记录"整体错位，分叉静默地
-/// 少复制 N 轮、甚至只剩 CLI chrome。行号由提取器自己产出，两个口径就不可能
+/// 算不算用户消息"的判据必然与提取器分家，于是"第 n 条 user 记录"整体错位，分叉
+/// 静默地少复制 N 轮、甚至只剩 CLI chrome。行号由提取器自己产出，两个口径就不可能
 /// 再分开。
+///
+/// `engine` 是三个引擎共用的同一个入口：凡是走同一份提取器 + `normalize_extracted_row`
+/// 的引擎，计数口径就与 `parse_session_file` 天然一致。**不要**再为某个引擎另写一份
+/// "原始行是否算 user 消息"的判据——Codex 曾经这么做过（直接用 `codex_line_is_visible_user`
+/// 数原始行），结果 `# AGENTS.md instructions` / `<environment_context>` / `<skill>`
+/// 这类会被规范化丢弃的注入行仍被计数，序号比锚点大，切点提前一轮，分支静默丢掉
+/// 用户点的那一轮。
 pub(crate) fn user_row_lines(
+    engine: &str,
     reader: impl BufRead,
     accepted_internal_frames: &HashSet<String>,
 ) -> Vec<usize> {
     let mut lines = Vec::new();
     walk_lines(
         reader,
-        &extractor_for("claude", ImageMode::Collect),
+        &extractor_for(engine, ImageMode::Collect),
         accepted_internal_frames,
         |line, row| {
             // 丢弃条件走 `user_row_is_visible`（与 `fold_rows` 同一个函数）：少算或多算
-            // 几条 user 行，`fork_keep_count` 里"第 n 条 user 记录"就整体错位，分叉会
-            // 静默切早或切晚一轮。两个集合必须由构造保证相同，不能靠"实际数据里不会
-            // 出现空文本行"。
+            // 几条 user 行，"第 n 条 user 记录"就整体错位，分叉会静默切早或切晚一轮。
+            // 两个集合必须由构造保证相同，不能靠"实际数据里不会出现空文本行"。
             if row.role == "user" && user_row_is_visible(&row.text, !row.images.is_empty()) {
                 lines.push(line);
             }
@@ -437,47 +443,13 @@ pub(crate) fn user_row_is_visible(text: &str, has_images: bool) -> bool {
     !(text.trim().is_empty() && !has_images)
 }
 
-/// codex 的一行是否产出**可见 user 消息**。
-///
-/// 与 `dsh_user_message_text` 同一个理由：提取器与 `fork_keep_count_codex` 必须共用
-/// 一份判据。codex 的可见 user 行 = `response_item` + `payload.type == "message"` +
-/// `role == "user"` + 有文本或图片（图片按 `ImageMode::Collect` 判，因为分叉拿到的
-/// `parsed` 就是 `parse_session_file` 用 Collect 解析出来的）。
-pub(crate) fn codex_line_is_visible_user(value: &Value) -> bool {
-    if type_str(value) != "response_item" {
-        return false;
-    }
-    let Some(payload) = value.get("payload") else {
-        return false;
-    };
-    if payload.get("type").and_then(Value::as_str) != Some("message") {
-        return false;
-    }
-    if payload.get("role").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    let content = payload.get("content");
-    let text = match content {
-        Some(Value::Array(parts)) => text_of_parts(parts, false, ""),
-        other => content_text(other),
-    };
-    let has_images = match content {
-        Some(Value::Array(parts)) => parts.iter().any(|part| codex_image_part(part).is_some()),
-        _ => false,
-    };
-    user_row_is_visible(&text, has_images)
-}
-
 /// dsh 的 `user/message` 里**用户真正输入**的文本；注入的运行时上下文与空文本返回
 /// `None`（那一行不算可见 user 消息）。
 ///
-/// 这个判据**必须只有一份定义**，因为它有两个消费者：
-/// 1. 提取器（`extract_dsh_line`）——决定哪一行产出可见 user 消息；
-/// 2. `fork_dsh::keep_count`——把"锚点是第几条可见 user 消息"映射到"它在**哪一轮**"。
-///
-/// 两处口径一旦分家，锚点就会落到相邻的轮上：分叉**静默**多带或少带一轮。dsh 的一轮
-/// 里本来就可能有不止一条 user 消息（子代理回报、自动 checkpoint），所以"第几条可见
-/// user 消息"与"第几轮"**不是一回事**——这正是这里要共享判据的原因。
+/// 这个判据**必须只有一份定义**：提取器（`extract_dsh_line`）用它决定哪一行产出可见
+/// user 消息。分叉切点**不再**单独调用它——切点走 `user_row_lines("dsh", …)`，与解析器
+/// 共用同一条流水线，这样"第几条可见 user 消息"与"第几轮"的口径天然一致（dsh 的一轮里
+/// 可以有多条可见 user 消息，两者本就**不是一回事**）。
 pub(crate) fn dsh_user_message_text(value: &Value) -> Option<String> {
     if type_str(value) != "user/message" {
         return None;
@@ -2724,7 +2696,7 @@ mod tests {
 
         let cursor = || std::io::Cursor::new(input.clone());
         assert_eq!(
-            user_row_lines(cursor(), &HashSet::new()),
+            user_row_lines("claude", cursor(), &HashSet::new()),
             [3, 5, 7, 8, usize::MAX],
             "可见 user 行的行号（0 起）+ 末尾哨兵"
         );

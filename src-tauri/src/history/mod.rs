@@ -20,13 +20,6 @@ pub(crate) use extract::user_row_lines;
 // **同一条**解码路径（多帧 zstd），不能自己再包一层。
 pub(crate) use extract::open_line_reader;
 
-// `dsh_user_message_text` 也要 crate 内部可见：`fork_dsh::keep_count` 靠它把"锚点是
-// 第几条可见 user 消息"映射到"它在哪一轮"，与提取器共用同一个判据（分开写会错位轮）。
-pub(crate) use extract::dsh_user_message_text;
-
-// 同理给 codex：`fork_keep_count_codex` 用它数"锚点之前有几条可见 user 消息"。
-pub(crate) use extract::codex_line_is_visible_user;
-
 use crate::engine::TodosPayload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

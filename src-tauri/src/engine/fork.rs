@@ -161,6 +161,18 @@ pub(crate) struct ForkSupport {
     /// 可能不对的路径——Codex 的 rollout 名里带着落盘时刻的时间戳，事后造不出同名
     /// 文件。
     pub derive_landing: Option<fn(&Path, &str) -> Result<PathBuf, String>>,
+    /// 回滚时删掉刚写出的分支产物（参数是 `copy_prefix` 返回的落盘路径）。
+    ///
+    /// 为什么需要按引擎区分：dsh 的分支是**目录 + 目录里的转录本**
+    /// （`session-<uuid>/session.v<N>.jsonl.zstd`）。只删文件会留下一个空目录，
+    /// 那个 id 仍然被占着，同 id 复用时会撞上 `copy_prefix` 的"目录已被占用"判定。
+    /// 其余两个引擎的分支就是单个文件。
+    pub cleanup: fn(&Path),
+}
+
+/// 回滚：删掉写出的分支文件。Claude / Codex 的分支产物就是这一个文件。
+fn remove_written_file(written: &Path) {
+    let _ = std::fs::remove_file(written);
 }
 
 /// 能力表：**唯一**的分叉白名单（查不到 = 该引擎暂不支持会话分叉）。
@@ -188,6 +200,7 @@ const CLAUDE_FORK: ForkSupport = ForkSupport {
     keep_count: fork_keep_count,
     copy_prefix: claude_copy_prefix,
     derive_landing: Some(claude_derive_landing),
+    cleanup: remove_written_file,
 };
 
 /// 分支新 id（Claude / Codex）：**裸 UUIDv4**。
@@ -207,6 +220,7 @@ const CODEX_FORK: ForkSupport = ForkSupport {
     keep_count: fork_keep_count_codex,
     copy_prefix: codex_copy_prefix,
     derive_landing: None,
+    cleanup: remove_written_file,
 };
 
 /// dsh：多帧 zstd 转录本，落在 `<源目录>/session-<新id>/session.v<N>.jsonl.zstd`
@@ -515,43 +529,54 @@ pub async fn fork_session(
     session_id: String,
     at: Option<ForkAnchor>,
 ) -> Result<ForkPlan, String> {
-    // 体积护栏必须**先于任何解析**：`resolve_fork_plan` 会为了定位分叉点把源
-    // 转录本整份解析一遍，`materialize_trimmed_fork` 里再查就晚了——几百 MB 的
-    // 文件已经被读进来解析过了。放在最前面，超限直接拒绝，一个字节都不读。
-    ensure_fork_source_within_limit(&state.db, &engine, &session_id)?;
-    let plan = resolve_fork_plan(&state.db, &engine, &session_id, at.as_ref())?;
-    // 标题先算（它不需要分支文件）：算不出来就别写文件，避免留下孤儿文件。
-    // 标题由后端按 `<源会话当前名> (fork #N)` 生成：编号要查现有的同级分支名，
-    // 只有后端知道它们；而后缀是语言中立的，不需要翻译。
-    let branch_title = next_fork_title(&state.db, &engine, &plan.source_title)?;
-    let keep = plan.keep_records.unwrap_or(usize::MAX);
-    let written = materialize_trimmed_fork(
-        &state.db,
-        &engine,
-        &plan.source_session_id,
-        &plan.target_session_id,
-        keep,
-    )?;
-    // 登记进应用自己的表：侧栏要能看到这条分支，`load_session_page` 也要求
-    // 先有 `sessions` 行，否则分支页签打开时会报 "session not found"。
-    //
-    // ⚠️ 登记失败**必须把刚写的文件删掉**（设计稿 §4.1 的失败语义：不留半成品）。
-    // 否则会留下一个最糟的中间态：磁盘上有一个能用的分支文件，但表里没有对应行
-    // ——随后的扫描会**补一行没有标题的记录**，于是分支看起来"能用"、却没有
-    // 分支标题，用户与开发者都看不出这里曾经失败过。
-    //
-    // 点名真实路径：`written` 就在手上，没有理由让登记去"猜"。
-    // 传 `None` 时推不出落盘路径的引擎（`ForkSupport::derive_landing` 为 `None`，
-    // 如 Codex）行里会留下空的 `file_path` —— 分支页签随后 `open("")` 失败，且
-    // 自定义 `codex_home` 下还会被扫描判为"在家目录之外"而**删掉整行**。
-    register_fork_or_rollback(
-        &state.db,
-        &engine,
-        &plan.source_session_id,
-        &plan.target_session_id,
-        &written,
-        &branch_title,
-    )?;
+    // 整条链路都是**阻塞 IO**：最多 64 MiB 的转录本读取、整份解析、写分支文件、
+    // SQLite 事务。直接跑在 async 命令里会占住运行时的工作线程（同 crate 的
+    // `load_session_page` 也是这个理由包在 `spawn_blocking` 里）。分叉本身只有一次，
+    // 但一次就能顶住几百毫秒到数秒。
+    let db = std::sync::Arc::clone(&state.db);
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        // 体积护栏必须**先于任何解析**：`resolve_fork_plan` 会为了定位分叉点把源
+        // 转录本整份解析一遍，`materialize_trimmed_fork` 里再查就晚了——几百 MB 的
+        // 文件已经被读进来解析过了。放在最前面，超限直接拒绝，一个字节都不读。
+        ensure_fork_source_within_limit(&db, &engine, &session_id)?;
+        let plan = resolve_fork_plan(&db, &engine, &session_id, at.as_ref())?;
+        // 标题先算（它不需要分支文件）：算不出来就别写文件，避免留下孤儿文件。
+        // 标题由后端按 `<源会话当前名> (fork #N)` 生成：编号要查现有的同级分支名，
+        // 只有后端知道它们；而后缀是语言中立的，不需要翻译。
+        let branch_title = next_fork_title(&db, &engine, &plan.source_title)?;
+        let keep = plan.keep_records.unwrap_or(usize::MAX);
+        let written = materialize_trimmed_fork(
+            &db,
+            &engine,
+            &plan.source_session_id,
+            &plan.target_session_id,
+            keep,
+        )?;
+        // 登记进应用自己的表：侧栏要能看到这条分支，`load_session_page` 也要求
+        // 先有 `sessions` 行，否则分支页签打开时会报 "session not found"。
+        //
+        // ⚠️ 登记失败**必须把刚写的文件删掉**（设计稿 §4.1 的失败语义：不留半成品）。
+        // 否则会留下一个最糟的中间态：磁盘上有一个能用的分支文件，但表里没有对应行
+        // ——随后的扫描会**补一行没有标题的记录**，于是分支看起来"能用"、却没有
+        // 分支标题，用户与开发者都看不出这里曾经失败过。
+        //
+        // 点名真实路径：`written` 就在手上，没有理由让登记去"猜"。
+        // 传 `None` 时推不出落盘路径的引擎（`ForkSupport::derive_landing` 为 `None`，
+        // 如 Codex）行里会留下空的 `file_path` —— 分支页签随后 `open("")` 失败，且
+        // 自定义 `codex_home` 下还会被扫描判为"在家目录之外"而**删掉整行**。
+        register_fork_or_rollback(
+            &db,
+            &engine,
+            &plan.source_session_id,
+            &plan.target_session_id,
+            &written,
+            &branch_title,
+        )?;
+        Ok::<ForkPlan, String>(plan)
+    })
+    .await
+    .map_err(|e| format!("会话分叉任务异常结束: {e}"))??;
+    // 广播留在 async 侧：它只是一次事件通知，不需要占用阻塞线程池。
     state.sink.emit_sessions_changed();
     Ok(plan)
 }
@@ -583,16 +608,94 @@ fn register_fork_or_rollback(
         Ok(false) => {
             // 文件在写完与登记之间消失（外部删除、杀软隔离）：登记拒绝写一行指向
             // 不存在文件的记录，这里也没什么可回滚的，但绝不能报成功。
-            let _ = std::fs::remove_file(written);
+            cleanup_fork_artifact(engine, written);
             Err(format!(
                 "分支转录本未被登记（文件不存在）: {}",
                 written.display()
             ))
         }
         Err(error) => {
-            let _ = std::fs::remove_file(written);
+            cleanup_fork_artifact(engine, written);
             Err(error)
         }
+    }
+}
+
+/// 按能力表回滚分支产物；查不到能力项时退化成"只删文件"（未知引擎本不该走到这里，
+/// 但回滚路径不能因此 panic 或什么都不删）。
+fn cleanup_fork_artifact(engine: &str, written: &Path) {
+    let cleanup = fork_support(engine)
+        .map(|support| support.cleanup)
+        .unwrap_or(remove_written_file);
+    cleanup(written);
+}
+
+/// 回滚与"坏行"语义的回归用例。
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccgui-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// dsh 的分支产物是目录 + 里面的转录本：回滚必须把目录一起删掉，否则那个
+    /// `session-<uuid>` 一直被占着（下次同 id 复用会撞上"目录已被占用"）。
+    #[test]
+    fn dsh_rollback_removes_the_branch_directory_too() {
+        let dir = temp_dir("dsh-rollback");
+        let branch = dir.join("session-3f7a1c2e-9b44-4d18-8a55-6c0d2e7b91af");
+        std::fs::create_dir_all(&branch).unwrap();
+        let written = branch.join("session.v4.jsonl.zstd");
+        std::fs::write(&written, b"x").unwrap();
+
+        cleanup_fork_artifact("dsh", &written);
+
+        assert!(!written.exists(), "转录本应被删掉");
+        assert!(!branch.exists(), "分支目录应被删掉");
+        assert!(dir.exists(), "上层目录不是我们的，不该动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单文件引擎（Claude / Codex）只删文件，不碰上层目录——那是引擎的会话目录，
+    /// 里面还有别的会话。
+    #[test]
+    fn rollback_for_file_only_engines_keeps_the_engine_directory() {
+        let dir = temp_dir("claude-rollback");
+        let written = dir.join("8a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d.jsonl");
+        std::fs::write(&written, b"x").unwrap();
+
+        cleanup_fork_artifact("claude", &written);
+
+        assert!(!written.exists());
+        assert!(dir.exists(), "引擎会话目录不属于本次分叉，不能删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 非 UTF-8 的行必须**原样搬过去**：`BufRead::lines()` 遇到它会直接报错，
+    /// 与"坏行不使整个分叉失败"的契约相反。
+    #[test]
+    fn a_non_utf8_line_is_copied_verbatim_instead_of_failing_the_fork() {
+        let dir = temp_dir("bad-utf8");
+        let source = dir.join("source.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"{\"type\":\"x\"}\n");
+        bytes.extend_from_slice(&[0xFF, 0xFE, b'\n']); // 非法 UTF-8 的一行
+        bytes.extend_from_slice(b"\n"); // 空行：不写出去
+        bytes.extend_from_slice(b"{\"type\":\"y\"}\n");
+        std::fs::write(&source, &bytes).unwrap();
+
+        let dest = dir.join("branch.jsonl");
+        copy_plain_jsonl_prefix(&source, &dest, usize::MAX, |_| false).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"{\"type\":\"x\"}\n");
+        expected.extend_from_slice(&[0xFF, 0xFE, b'\n']);
+        expected.extend_from_slice(b"{\"type\":\"y\"}\n");
+        assert_eq!(std::fs::read(&dest).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -790,7 +893,7 @@ fn copy_plain_jsonl_prefix(
     }
 
     let file = std::fs::File::open(source_path).map_err(|e| format!("打开源转录本失败: {e}"))?;
-    let reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file);
     use std::io::{BufRead, Write};
     let mut out = std::fs::OpenOptions::new()
         .write(true)
@@ -799,27 +902,55 @@ fn copy_plain_jsonl_prefix(
         .map_err(|e| format!("创建分支转录本失败: {e}"))?;
 
     let write_result = (|| -> Result<(), String> {
-        for (index, line) in reader.lines().enumerate() {
+        // 按**字节**读，不按 `String` 行读：`BufRead::lines()` 遇到非 UTF-8 字节会
+        // 直接返回 `InvalidData`，整个分叉跟着失败——而这里的契约是"坏行原样搬过去"。
+        // 转录本原则上都是 UTF-8，但只要有一行不是，用户就分叉不了、且报错信息与
+        // 真实原因（"这一行不是 UTF-8"）对不上。按字节读之后，能解析成 JSON 的就
+        // 改写身份，解不出来的（含非 UTF-8）原样写出，行为与注释一致。
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut index = 0usize;
+        loop {
             if index >= keep_records {
                 break;
             }
-            let line = line.map_err(|e| format!("读取源转录本失败: {e}"))?;
-            if line.trim().is_empty() {
+            buffer.clear();
+            let read = reader
+                .read_until(b'\n', &mut buffer)
+                .map_err(|e| format!("读取源转录本失败: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            // 去掉行尾换行（`lines()` 同样会去掉 `\n` 与紧随的 `\r`）。
+            if buffer.last() == Some(&b'\n') {
+                buffer.pop();
+                if buffer.last() == Some(&b'\r') {
+                    buffer.pop();
+                }
+            }
+            index += 1;
+            // 空行不写出去（与旧行为一致）；行号照旧计入 `keep_records`，因为切点
+            // 给的是**源行号**。
+            if buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
                 continue;
             }
-            let rewritten = match serde_json::from_str::<serde_json::Value>(&line) {
-                Ok(mut value) => {
-                    if rewrite_identity(&mut value) {
-                        serde_json::to_string(&value)
-                            .map_err(|e| format!("序列化记录失败: {e}"))?
-                    } else {
-                        line
+            let rewritten: Vec<u8> = match std::str::from_utf8(&buffer) {
+                // 非 UTF-8：原样搬（无法解析 JSON，也就无从改写身份）。
+                Err(_) => buffer.clone(),
+                Ok(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(mut value) => {
+                        if rewrite_identity(&mut value) {
+                            serde_json::to_string(&value)
+                                .map_err(|e| format!("序列化记录失败: {e}"))?
+                                .into_bytes()
+                        } else {
+                            buffer.clone()
+                        }
                     }
-                }
-                // 坏行（CLI 容忍）原样搬过去，不因为一行坏数据让整个分叉失败。
-                Err(_) => line,
+                    // 坏行（CLI 容忍）原样搬过去，不因为一行坏数据让整个分叉失败。
+                    Err(_) => buffer.clone(),
+                },
             };
-            out.write_all(rewritten.as_bytes())
+            out.write_all(&rewritten)
                 .map_err(|e| format!("写入分支转录本失败: {e}"))?;
             out.write_all(b"\n")
                 .map_err(|e| format!("写入分支转录本失败: {e}"))?;
@@ -1292,7 +1423,8 @@ fn fork_keep_count(
     let user_ordinal = anchor_turn(parsed, anchor)?;
 
     let file = std::fs::File::open(path).ok()?;
-    let lines = crate::history::user_row_lines(std::io::BufReader::new(file), accepted_frames);
+    let lines =
+        crate::history::user_row_lines("claude", std::io::BufReader::new(file), accepted_frames);
     // 切在**锚点轮之后**那条用户记录的行上：分支**包含**用户点的那一轮
     // （"请教一个数学题"这一轮 + 之前所有内容），而不是把它排除在外。
     // `user_row_lines` 自带末尾哨兵，锚点轮是最后一轮时这里拿到的是整份文件。
@@ -1302,57 +1434,171 @@ fn fork_keep_count(
 /// Codex 的记录级切点。与 Claude 不同，Codex 必须切在**完整轮次**边界上：
 /// 它的轮次是 `event_msg` 的 `task_started` … `task_complete` 包起来的，而
 /// 非会话记录（`turn_context` / `token_count`）散落在轮内。直接用"第 n 条
-/// user 记录的行号"会切进某一轮中间，留下没有 `task_complete` 的残轮。
+/// user 记录的行号"会切进某一轮中间，留下没有结束标记的残轮。
 ///
-/// 做法：先选中锚点所在的**轮**（第 `n` 轮，从 1 起），再取第 `n-1` 轮结束
-/// 那条 `task_complete` 的**后一行**——分支就正好"从第 n 轮开始"。
+/// 做法分两步，两步都只认**一份**判据：
+/// 1. 锚点那条 user 消息落在**第几行**——来自 `user_row_lines("codex", …)`，与
+///    `parse_session_file` 走同一条提取器 + `normalize_extracted_row` 流水线。
+///    ⚠️ 不能改用 `codex_line_is_visible_user` 直接数原始行：它只判"有没有文本或
+///    图片"，不经过规范化，于是 `# AGENTS.md instructions` / `<environment_context>` /
+///    `<skill>` 这类会被提取器丢弃的注入行仍被计数，`users_seen` 比锚点序号大，
+///    切点提前一轮——分支静默丢掉用户点的那一轮（已有回归用例
+///    `hidden_context_rows_must_not_shift_the_cut`）。
+/// 2. 从锚点那一行往后，找**本轮结束标记**：`task_complete`，或用户中断写入的
+///    `turn_aborted`。只看 `task_complete` 会让被中断的轮一直往后找到下一轮的
+///    标记，分支多带一轮（回归用例
+///    `an_aborted_anchor_turn_must_not_pull_in_the_next_turn`）。
 fn fork_keep_count_codex(
     path: &Path,
     anchor: &ForkAnchor,
     parsed: &[crate::history::Message],
-    // Codex 的切点靠轮标记（`task_complete`）求，不需要"哪条原始记录算用户消息"
-    // 的口径，所以这里用不到已接受的内部帧集合。签名与能力表保持一致，是为了让
-    // 表里两行同型——将来加引擎时不必区分"要不要这个参数"。
-    _accepted_frames: &std::collections::HashSet<String>,
+    accepted_frames: &std::collections::HashSet<String>,
 ) -> Option<usize> {
-    // 定位与 Claude 完全同源（`anchor_turn`）：它给出"锚点是第几条**可见 user 消息**"，
-    // 命中判据只有这一份。但**不能**把这个序号直接当轮号——codex 的一轮由
-    // `task_started` … `task_complete` 包起来，里面可以有多条 user 消息，两者在
-    // 1:1 时才相等。序号被当成轮号时，锚点落在某轮的第二条消息上会让切点落到
-    // **更晚一轮**的 `task_complete`，分支静默多带一轮内容。
-    //
-    // 所以判据是"累计可见 user 消息数越过锚点序号之后的**第一个** `task_complete`"：
-    // 它既是锚点那条消息所在轮结束的位置，又不需要轮起始标记——`task_started` 在本
-    // 仓库里从未被读取过（`payload.turn` 也是），拿它当判据等于把切点建在没验证的形状上。
+    // 锚点是"第几条**可见 user 消息**"（0 起）——命中判据只有 `anchor_turn` 这一份，
+    // 它的可见口径就是解析器口径，与下面第 1 步的行号同源。
     let anchor_user_ordinal = anchor_turn(parsed, anchor)?;
 
     let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    let user_lines =
+        crate::history::user_row_lines("codex", std::io::BufReader::new(file), accepted_frames);
+    // 锚点那条消息的源行号。哨兵 `usize::MAX` 只有在锚点序号超出可见 user 条数时才
+    // 会被取到，而 `anchor_turn` 的序号一定落在范围内，所以这里不会拿到它。
+    let anchor_line = *user_lines.get(anchor_user_ordinal)?;
+    if anchor_line == usize::MAX {
+        return None;
+    }
+
+    // 第二轮只找轮次结束标记：从锚点那行开始扫（锚点之前的标记属于更早的轮）。
+    let file = std::fs::File::open(path).ok()?;
     use std::io::BufRead;
-    let mut users_seen = 0usize;
-    for (index, line) in reader.lines().enumerate() {
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        if index < anchor_line {
+            continue;
+        }
         let Ok(line) = line else { continue };
         let Some(value) = parse_json_line(&line) else {
             continue;
         };
-        if crate::history::codex_line_is_visible_user(&value) {
-            users_seen += 1;
-            continue;
-        }
-        let is_complete = value.get("type").and_then(serde_json::Value::as_str) == Some("event_msg")
-            && value
-                .get("payload")
-                .and_then(|p| p.get("type"))
-                .and_then(serde_json::Value::as_str)
-                == Some("task_complete");
-        if is_complete && users_seen > anchor_user_ordinal {
-            // 保留到锚点轮的 task_complete 为止（含）——分支包含用户点的那一轮。
+        if codex_line_ends_turn(&value) {
+            // 保留到结束标记这一行为止（含）——分支包含用户点的那一轮。
             return Some(index + 1);
         }
     }
-    // 锚点轮还不是完整轮（没有 task_complete），或转录本被截过：不猜，报定位失败。
+    // 锚点轮还没有结束标记（仍在跑），或转录本被截过：不猜，报定位失败。
     // 界面只在已定稿的行上给分叉入口，所以正常情况下不会走到这里。
     None
+}
+
+/// Codex 的一行是否标记**一轮结束**。
+///
+/// 两个来源，缺一不可：
+/// - `event_msg/task_complete`：正常完成。
+/// - `event_msg/turn_aborted`：用户中断（Esc）。被中断的轮**同样是完整轮次**——
+///   它已经落盘、界面上可见、用户可能就想从这一轮分叉。只认 `task_complete`
+///   时，锚点在中断轮上会一路找到下一轮的标记，分支多带一轮内容。
+fn codex_line_ends_turn(value: &serde_json::Value) -> bool {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    matches!(
+        value
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(serde_json::Value::as_str),
+        Some("task_complete") | Some("turn_aborted")
+    )
+}
+
+/// Codex 切点的回归用例。
+///
+/// 两条都对应真实缺陷（代码评审时用临时测试复现过）：
+/// - 注入行（`# AGENTS.md instructions` / `<environment_context>` / `<skill>`）会被
+///   提取器的规范化丢弃，但它们**确实**是 `role=user` 的 `response_item`。按"原始行
+///   是不是 user"计数时它们被算进轮次，`users_seen` 比锚点序号大，切点提前一轮，
+///   用户点的那一轮本身消失。
+/// - `turn_aborted`（用户按 Esc 中断）同样是轮次终点。只认 `task_complete` 时，
+///   锚点落在中断轮上会一路找到**下一轮**的结束标记，分支多带一整轮。
+///
+/// 断言写的是"分支重新解析后有哪些消息"，不是中间量：用户能看到的才作数。
+#[cfg(test)]
+mod codex_cut_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const META: &str = r#"{"type":"session_meta","payload":{"id":"src"}}"#;
+    const AGENTS: &str = r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/ws\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>"}]}}"##;
+    const ENV: &str = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp/ws</cwd>\n</environment_context>"}]}}"#;
+    const START: &str = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+    const DONE: &str = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+    const ABORT: &str = r#"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#;
+
+    fn msg(role: &str, kind: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"{role}","content":[{{"type":"{kind}","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// 按 `fork_keep_count_codex` 的切点截出前缀，再用**普通解析**读回来。
+    fn branch_messages(lines: &[&str], anchor_text: &str) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("ccgui-codex-cut-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("rollout-src.jsonl");
+        std::fs::write(&source, lines.join("\n") + "\n").unwrap();
+        let parsed =
+            crate::history::parse_session_file("codex", &source, &HashSet::new()).unwrap().messages;
+        let anchor = ForkAnchor {
+            user_text_sha256: text_sha256_hex(anchor_text),
+            seq_hint: None,
+        };
+        let keep = fork_keep_count_codex(&source, &anchor, &parsed, &HashSet::new())
+            .expect("应能定位到锚点轮");
+        let branch = dir.join("rollout-branch.jsonl");
+        let body: String = lines.iter().take(keep).map(|line| format!("{line}\n")).collect();
+        std::fs::write(&branch, body).unwrap();
+        let out = crate::history::parse_session_file("codex", &branch, &HashSet::new())
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| format!("{}:{}", m.role, m.text))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// 注入行不能改变"锚点是第几条可见 user 消息"的计数。
+    #[test]
+    fn hidden_context_rows_do_not_shift_the_cut() {
+        let (q1, a1) = (msg("user", "input_text", "Q1"), msg("assistant", "output_text", "A1"));
+        let (q2, a2) = (msg("user", "input_text", "Q2"), msg("assistant", "output_text", "A2"));
+        let (q3, a3) = (msg("user", "input_text", "Q3"), msg("assistant", "output_text", "A3"));
+        let lines = [
+            META, AGENTS, ENV, START, &q1, &a1, DONE, START, &q2, &a2, DONE, START, &q3, &a3, DONE,
+        ];
+        // 缺陷表现：分支只有 ["user:Q1","assistant:A1"]，用户点的 Q2 那一轮整个丢失。
+        assert_eq!(
+            branch_messages(&lines, "Q2"),
+            ["user:Q1", "assistant:A1", "user:Q2", "assistant:A2"]
+        );
+    }
+
+    /// 被中断的轮是完整轮次：切点必须停在它的 `turn_aborted` 上，不能越过它。
+    #[test]
+    fn an_aborted_anchor_turn_does_not_pull_in_the_next_turn() {
+        let q1 = msg("user", "input_text", "Q1");
+        let (q2, a2) = (msg("user", "input_text", "Q2"), msg("assistant", "output_text", "A2"));
+        let lines = [META, START, &q1, ABORT, START, &q2, &a2, DONE];
+        let branch = branch_messages(&lines, "Q1");
+        assert_eq!(branch, ["user:Q1"]);
+    }
+
+    /// 锚点就是最后一轮、且该轮被中断：这是合法的切点（= 整份文件），
+    /// 不能因为"找不到 `task_complete`"就报定位失败。
+    #[test]
+    fn an_aborted_last_turn_is_a_valid_cut() {
+        let q1 = msg("user", "input_text", "Q1");
+        let lines = [META, START, &q1, ABORT];
+        assert_eq!(branch_messages(&lines, "Q1"), ["user:Q1"]);
+    }
 }
 
 #[cfg(test)]
@@ -1760,9 +2006,10 @@ mod tests {
         // 一份合成的 Codex rollout：两轮，每轮 task_started … task_complete，
         // 轮内夹着非会话记录（turn_context / token_count）。
         //
-        // 两条 `response_item` 必须带 `role` 与 `content`：切点会**在文件里**数可见
-        // user 消息（`codex_line_is_visible_user`，与提取器同一个判据），只有 payload.type
-        // 的空壳在真实日志里不存在，也数不出任何 user 消息。
+        // 两条 `response_item` 必须带 `role` 与 `content`：切点先经
+        // `history::user_row_lines("codex", …)` 定位锚点的**源行号**（与解析器同一条
+        // 提取器 + 规范化流水线），只有 payload.type 的空壳在真实日志里不存在，
+        // 也定位不到任何 user 消息。
         let lines = [
             r#"{"type":"session_meta","payload":{"id":"src"}}"#,          // 0
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,  // 1 轮1开始

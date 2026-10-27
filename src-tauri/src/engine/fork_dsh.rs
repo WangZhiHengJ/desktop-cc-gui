@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::fork::{is_uuid, ForkAnchor, ForkSupport};
+use super::fork::{is_uuid, ForkAnchor};
 use crate::history::Message;
 
 /// 会话 id 前缀。dsh 的目录名与 header 的 `id` 都用它，两者是同一个字符串。
@@ -41,7 +41,22 @@ pub(crate) const DSH_FORK: super::fork::ForkSupport = super::fork::ForkSupport {
     keep_count,
     copy_prefix,
     derive_landing: Some(derive_landing),
+    cleanup: remove_written_transcript_and_dir,
 };
+
+/// dsh 的分支产物是**目录 + 目录里的转录本**，回滚要一起删。
+///
+/// 只删文件会留下一个空目录：那个 `session-<uuid>` 仍然占着 id，下次拿到同一个 id
+/// 复用时会撞上 `copy_prefix` 的"目录已被占用"判定（它会拒绝在非空目录里写），
+/// 而 `dsh_candidates()` 也一直把这个空目录当成一个候选。
+///
+/// `remove_dir` 只删**空**目录：目录非空说明里面还有别的东西，那时保留比误删安全。
+fn remove_written_transcript_and_dir(written: &Path) {
+    let _ = std::fs::remove_file(written);
+    if let Some(dir) = written.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
 
 /// dsh 能当分叉来源的会话 id 形状：`session-<uuid>`（真实值，目录名与 header 的
 /// `id` 都是它），也收**裸 uuid**（老数据里出现过同形目录，调用方少写一截前缀
@@ -178,42 +193,45 @@ pub(crate) fn keep_count(
     path: &Path,
     anchor: &ForkAnchor,
     parsed: &[Message],
-    // dsh 的切点靠轮标记（`turn/start` / `turn/end`）求，不需要"哪条原始记录算
-    // 用户消息"的口径。签名与能力表保持一致，好让表里各行同型（与 Codex 同）。
-    _accepted_frames: &HashSet<String>,
+    accepted_frames: &HashSet<String>,
 ) -> Option<usize> {
     // 锚点是全文件第几条**可见 user 消息**（0 起）——命中判据只有 `anchor_turn` 这一份。
     let anchor_user_ordinal = super::fork::anchor_turn(parsed, anchor)?;
 
+    // 锚点那条消息落在**第几行**：与 `parse_session_file` 同一条提取器 + 规范化流水线
+    // （`user_row_lines`）。⚠️ 不能自己拿 `dsh_user_message_text` 数原始行——那只是
+    // "有没有文本"的快速判断，不经过 `normalize_extracted_row`，遇到整条都是注入块
+    // 或内部帧的 `user/message` 时会多算，序号比锚点大，切点提前一轮。Codex 曾经
+    // 就是这么错的（见 `fork.rs` 的 `fork_keep_count_codex`）。
+    let anchor_line = {
+        let reader = crate::history::open_line_reader("dsh", path).ok()?;
+        *crate::history::user_row_lines("dsh", reader, accepted_frames).get(anchor_user_ordinal)?
+    };
+    // 哨兵 `usize::MAX` 只会在锚点序号超出可见 user 条数时取到，而 `anchor_turn` 的
+    // 序号一定落在范围内。
+    if anchor_line == usize::MAX {
+        return None;
+    }
+
+    // 第二轮：从锚点那一行往后找 `turn/end`，切在它上面（含该行）。
+    //
+    // **不能**改成"数第几轮的 `turn/end`"：dsh 的一轮里可以有多条可见 user 消息，
+    // 轮号与 user 序号在 1:1 时才相等。按锚点**行号**往后找轮尾就没有这个假设。
     let reader = crate::history::open_line_reader("dsh", path).ok()?;
     use std::io::BufRead;
-    let mut current_turn = 0usize;
-    let mut seen_users = 0usize;
-    // 锚点那条消息落在第几轮：找到之后等这一轮的 `turn/end` 就是切点。
-    let mut anchor_turn_number: Option<usize> = None;
     for (index, line) in reader.lines().enumerate() {
+        if index < anchor_line {
+            continue;
+        }
         let Ok(line) = line else { continue };
         let Some(value) = super::fork::parse_json_line(&line) else {
             continue;
         };
-        match line_type(&value) {
-            Some("turn/start") => current_turn += 1,
-            Some("user/message") => {
-                if crate::history::dsh_user_message_text(&value).is_some() {
-                    if seen_users == anchor_user_ordinal {
-                        anchor_turn_number = Some(current_turn);
-                    }
-                    seen_users += 1;
-                }
-            }
-            Some("turn/end") if anchor_turn_number == Some(current_turn) => {
-                // 含 `turn/end` 这一行：分支"包含锚点那一轮"。
-                return Some(index + 1);
-            }
-            _ => {}
+        if line_type(&value) == Some("turn/end") {
+            return Some(index + 1);
         }
     }
-    // 锚点轮没有 `turn/end`：不猜，报定位失败。
+    // 锚点轮没有 `turn/end`（还在跑）：不猜，报定位失败。
     None
 }
 
@@ -316,14 +334,20 @@ pub(crate) fn copy_prefix(
         // 逐行搬，**不挑行**：辅助记录（`turn/start`、`step/*`、`tool/*`）也要搬，
         // 否则分支里的一轮没有边界标记，切点与宿主回读都会错。
         //
-        // `keep_records` 数是"写出去的条数"（header 算第一条），与明文那条复制
-        // 路径同一口径：`usize::MAX` = 整份文件。
+        // `keep_records` 数是"保留源文件前多少**行**"（header 算第 1 行），与
+        // `keep_count` 返回的 `turn/end` 原始行号 + 1 同一口径，也与明文那条复制路径
+        // （`copy_plain_jsonl_prefix` 的 `index >= keep_records`）一致。
+        //
+        // ⚠️ 曾经这里按"写出去的非空行"计数（`written`），而 `keep_count` 给的是**原始
+        // 行号**（含空行）：源流里只要有一个空行，两个口径就差 1，复制会越过切点往后
+        // 多带几行。现在统一成按**源行号**截断，空行仍然跳过不写（zstd 流里空行没有
+        // 意义），但不再影响"截到哪一行"。
         //
         // 第二帧**按需创建**：只保留 header（`keep_records == 1`）时不该多写一个空帧。
         let mut rest: Option<zstd::stream::write::Encoder<&mut std::fs::File>> = None;
-        let mut written = 1usize;
-        for line in lines {
-            if written >= keep_records {
+        for (offset, line) in lines.enumerate() {
+            // `lines` 已经消费掉 header（源文件第 0 行），所以 `offset + 1` 就是源行号。
+            if offset + 1 >= keep_records {
                 break;
             }
             let line = line.map_err(|e| format!("读取源转录本失败: {e}"))?;
@@ -341,7 +365,6 @@ pub(crate) fn copy_prefix(
                 .write_all(line.as_bytes())
                 .and_then(|_| frame.write_all(b"\n"))
                 .map_err(|e| format!("写入分支转录本失败: {e}"))?;
-            written += 1;
         }
         if let Some(frame) = rest {
             frame
@@ -652,8 +675,9 @@ mod tests {
     /// 二条上会得到**并不存在的第 3 轮**——用户点了自己看得见的消息，却收到"未能在
     /// 转录本中定位该轮消息"；更糟的情形是后面还有轮，切点会**静默落到更晚的一轮**。
     ///
-    /// 所以分两步：先用 `anchor_turn` 定位是第几条可见 user 消息，再用提取器**同一个**判据
-    /// （`dsh_user_message_text`）在文件里找出它所在的轮。
+    /// 所以分两步：先用 `anchor_turn` 定位是第几条可见 user 消息，再用
+    /// `history::user_row_lines("dsh", …)`（与解析器同一条提取器 + 规范化流水线）
+    /// 拿到那条消息的**源行号**，从那里往后找 `turn/end`。
     #[test]
     fn anchoring_the_second_user_message_of_a_turn_still_cuts_that_turn() {
         let (root, source, _id) = fixture(4, 4, true);
