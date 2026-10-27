@@ -92,6 +92,43 @@ export function resolveForkAnchor(
   return null;
 }
 
+/** 一条消息的分叉锚点：该轮用户消息的原始文本与 seq（见 `resolveForkAnchor`）。 */
+export type ForkAnchorTarget = { text: string; seq: number };
+
+/**
+ * 一次性算出**每条消息**的锚点（用户行取自己，之后的行取最近的前一条用户行）。
+ *
+ * 为什么不再逐行调 `resolveForkAnchor`：那样每行都要对自己的 `neighbors` 做一次
+ * `indexOf`，长列表里是 O(n²)；更糟的是 `neighbors` 只能是 `session.messages`，
+ * 而它在**每次流式 flush 时都是新数组**——把它当 prop 传给每行，行级 `memo`
+ * 就全部失效（`timeline-rows.ts` 的 WeakMap 行缓存因此白做），所有可见行每次
+ * flush 都重渲染。改成在这里一趟算完、每行只拿到自己的 `{text, seq}` 之后，
+ * 行组件收到的是**稳定的原始值**，未变化的行可以直接跳过。
+ *
+ * 复杂度：O(n)（只扫一遍，用户行即当前锚点）。
+ */
+export function resolveForkAnchors(
+  neighbors: readonly Message[],
+): ReadonlyMap<Message, ForkAnchorTarget> {
+  const anchors = new Map<Message, ForkAnchorTarget>();
+  let current: ForkAnchorTarget | null = null;
+  for (const row of neighbors) {
+    // 卡片行（授权 / 问答 / 计划）不是对话轮次：`continue` 而不是清空 `current`，
+    // 它们夹在轮次中间，不该切断已有锚点。
+    if (row.role === "user") current = { text: row.text, seq: row.seq };
+    if (current) anchors.set(row, current);
+  }
+  return anchors;
+}
+
+/** 取某一行的锚点；非消息行（过程组 / 压缩痕迹）没有锚点。 */
+function forkAnchorFor(
+  row: TimelineRow,
+  anchors: ReadonlyMap<Message, ForkAnchorTarget>,
+): ForkAnchorTarget | null {
+  return row.kind === "msg" ? (anchors.get(row.message) ?? null) : null;
+}
+
 const TimelineRowView = memo(function TimelineRowView({
   row,
   workspacePath,
@@ -101,7 +138,7 @@ const TimelineRowView = memo(function TimelineRowView({
   thinkingAutoCollapse,
   seenTools,
   searchTarget,
-  neighbors,
+  forkAnchor,
   sessionRemote,
   forkPending,
 }: {
@@ -120,8 +157,9 @@ const TimelineRowView = memo(function TimelineRowView({
   thinkingAutoCollapse: boolean;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
-  /** 完整消息列表（含被虚拟化裁掉的行）：分叉要回溯「该轮的用户消息」。 */
-  neighbors: readonly Message[];
+  /** 这一行自己的分叉锚点（`resolveForkAnchors` 预先算好）。**不要**改回传整份
+   *  消息列表：它在每次流式 flush 时都是新数组，行级 `memo` 会全部失效。 */
+  forkAnchor: ForkAnchorTarget | null;
   /** 远程会话（不分叉）与该来源会话的分叉在飞标记，透传给消息行。 */
   sessionRemote: boolean;
   forkPending: boolean;
@@ -169,7 +207,7 @@ const TimelineRowView = memo(function TimelineRowView({
       turnLive={turnLive}
       sessionRemote={sessionRemote}
       forkPending={forkPending}
-      neighbors={neighbors}
+      forkAnchor={forkAnchor}
     />
   );
 });
@@ -511,7 +549,7 @@ export const MessageRow = memo(function MessageRow({
   message,
   workspacePath,
   turnFinal,
-  neighbors,
+  forkAnchor,
   turnLive = false,
   sessionRemote = false,
   forkPending = false,
@@ -519,10 +557,9 @@ export const MessageRow = memo(function MessageRow({
   message: Message;
   workspacePath: string;
   turnFinal: boolean;
-  /** 这条消息所在的完整列表（含未挂载的行）；分叉要找「该轮的用户消息」，
-   *  而它可能在被虚拟化裁掉的窗口之外。缺省为空表示"没有邻域可回溯"——
-   *  此时不显示分叉入口，而不是猜一个位置。 */
-  neighbors?: readonly Message[];
+  /** 这条消息的分叉锚点（`resolveForkAnchors` 预先算好）。`null` 表示这条消息
+   *  回溯不到「该轮的用户消息」——此时不显示分叉入口，而不是猜一个位置。 */
+  forkAnchor?: ForkAnchorTarget | null;
   /** 本轮还在流式：分叉入口保留占位但禁用。 */
   turnLive?: boolean;
   /** 会话目录里的远程标记（远程会话不分叉）；由时间线取一次往下传，避免每行
@@ -571,7 +608,7 @@ export const MessageRow = memo(function MessageRow({
   // 点。**绝不能拿 `turnFinal` 当闸门**——它只由 buildRows 打给助手行
   // （timeline-rows.ts 的收尾扫描），用户行恒为 false，那样用户气泡的入口永远
   // 渲染不出来，而"每条消息都有常驻操作行"是设计约定（design §4.3.1）。
-  const forkTarget = resolveForkAnchor(neighbors ?? [], message);
+  const forkTarget = forkAnchor ?? null;
   // 可见性只看"能否定位到这一轮"，**不**看这一轮有没有文本：纯图片轮定位得到但没有
   // 可用的文本摘要，那是"不可用"（置灰 + 说明），不是"看不见"。
   const showFork = forkTarget !== null;
@@ -795,6 +832,10 @@ export const MessageTimeline = memo(function MessageTimeline({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const items = session.messages;
   const rows = useMemo(() => buildRows(items), [items]);
+  // 分叉锚点在这里一趟算好（而不是每行各算一次）：`Map` 只在消息列表变化时重建，
+  // 每行拿到的是自己的 `{text, seq}`——行级 memo 因此仍然有效。详见
+  // `resolveForkAnchors` 的注释。
+  const forkAnchors = useMemo(() => resolveForkAnchors(items), [items]);
   // Anchor rail: one dash per user message (reference: messageAnchors).
   const buildAnchorRows = useMemo(createAnchorRowsBuilder, []);
   const anchors = useMemo(() => buildAnchorRows(rows), [buildAnchorRows, rows]);
@@ -1047,7 +1088,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                     thinkingAutoCollapse={thinkingAutoCollapse}
                     seenTools={seenTools}
                     searchTarget={item.index === currentSearchRow ? processSearchTarget : undefined}
-                    neighbors={session.messages}
+                    forkAnchor={forkAnchorFor(rows[item.index], forkAnchors)}
                     sessionRemote={sessionRemote}
                     forkPending={forkPending}
                   />

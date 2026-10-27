@@ -2,7 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatDuration } from "./format-duration";
-import { MessageRow, MessageTimeline } from "./MessageTimeline";
+import { MessageRow, MessageTimeline, resolveForkAnchors } from "./MessageTimeline";
 import { buildBotBlock } from "./agent-block";
 import { useChatStore } from "../store";
 import { useBotStore } from "@/features/bots/bot-store";
@@ -290,7 +290,7 @@ describe("assistant message actions", () => {
           message={reply}
           workspacePath="/ws"
           turnFinal
-          neighbors={[{ seq: 1, role: "user", text: "问题", ts: null }, reply]}
+          forkAnchor={resolveForkAnchors([{ seq: 1, role: "user", text: "问题", ts: null }, reply]).get(reply) ?? null}
         />,
       );
     });
@@ -310,7 +310,7 @@ describe("assistant message actions", () => {
     // 只有助手行、没有本轮提问：宁可不给入口，也不猜分叉位置。
     await act(async () => {
       root.render(
-        <MessageRow message={reply} workspacePath="/ws" turnFinal neighbors={[reply]} />,
+        <MessageRow message={reply} workspacePath="/ws" turnFinal forkAnchor={resolveForkAnchors([reply]).get(reply) ?? null} />,
       );
     });
     expect(container.querySelector(".message-fork-btn")).toBeNull();
@@ -324,7 +324,7 @@ describe("assistant message actions", () => {
           message={{ ...reply, ts: "2026-10-21T12:00:00.000Z" }}
           workspacePath="/ws"
           turnFinal={false}
-          neighbors={[{ seq: 1, role: "user", text: "问题", ts: null }]}
+          forkAnchor={{ text: "问题", seq: 1 }}
         />,
       );
     });

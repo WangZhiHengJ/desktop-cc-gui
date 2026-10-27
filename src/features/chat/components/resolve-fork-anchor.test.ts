@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveForkAnchor } from "./MessageTimeline";
+import { resolveForkAnchor, resolveForkAnchors } from "./MessageTimeline";
 import type { Message } from "@/lib/ipc";
 
 const msg = (seq: number, role: string, text: string): Message => ({
@@ -76,5 +76,32 @@ describe("resolveForkAnchor", () => {
 
   it("returns null for an empty list", () => {
     expect(resolveForkAnchor([], msg(1, "assistant", "x"))).toBeNull();
+  });
+});
+describe("resolveForkAnchors", () => {
+  it("一趟算出每条消息的锚点，与逐条调 resolveForkAnchor 等价", () => {
+    const anchors = resolveForkAnchors(convo);
+    for (const message of convo) {
+      expect(anchors.get(message)).toEqual(resolveForkAnchor(convo, message));
+    }
+  });
+
+  it("首条 user 之前的行没有锚点", () => {
+    const rows = [msg(1, "assistant", "开场白"), msg(2, "user", "问题")];
+    const anchors = resolveForkAnchors(rows);
+    expect(anchors.get(rows[0])).toBeUndefined();
+    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 2 });
+  });
+
+  it("卡片行（非 user）不切断已有锚点", () => {
+    const rows = [
+      msg(1, "user", "问题"),
+      msg(2, "tool", "授权卡片"),
+      msg(3, "assistant", "回答"),
+    ];
+    const anchors = resolveForkAnchors(rows);
+    // 卡片行与它后面的助手行都归到同一条 user 消息上。
+    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 1 });
+    expect(anchors.get(rows[2])).toEqual({ text: "问题", seq: 1 });
   });
 });
