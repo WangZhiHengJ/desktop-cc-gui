@@ -530,9 +530,13 @@ export function createSessionActions(
 
     forkSession: async (engine, sessionId, workspacePath, anchor) => {
       const key = sessionKey(engine, sessionId, workspacePath);
-      // 防重入：分叉是一次"点击即落盘"的 IPC，双击（或两个窗口同时点）会让
-      // 两次调用各建一个分支——后端各自分配标题编号，用户拿到两条看起来一样的
-      // 会话。同一来源会话在飞期间，后续点击直接丢弃；入口据此置灰成"进行中"。
+      // 防重入：分叉是一次"点击即落盘"的 IPC，连点两次会让后端各建一个分支——
+      // 各自分配标题编号，用户拿到两条看起来一样的会话。同一来源会话在飞期间，
+      // 后续点击直接丢弃；入口据此置灰成"进行中"。
+      //
+      // 注意范围：`forkingByKey` 是**本窗口**的 store 状态。它挡的是同一个渲染进程
+      // 里的重复点击，**挡不住**另一个窗口/第二个渲染进程同时分叉（那属于后端
+      // 编号查重的职责，最终仍只有一个分支拿到 `#1`，另一个是 `#2`）。
       if (get().forkingByKey[key]) return;
       set((s) => ({ forkingByKey: { ...s.forkingByKey, [key]: true } }));
       try {
@@ -541,7 +545,18 @@ export function createSessionActions(
         // 再发一条消息才"落地"（惰性落地会让分支窗口在点击后是空的）。
         // 分支标题由**后端**生成（`<来源标题> (fork #N)`）：编号要与已有标题查重，
         // 只有后端知道现有标题；后缀语言中立，所以不必经过 i18n。
-        const plan = await ipc.forkSession(engine, sessionId, anchor ?? null);
+        //
+        // ⚠️ 这一步单独 try：**只有分叉本身失败**才说"创建分支失败"。下面插页签、
+        // 读历史失败时分支其实已经建好了，再套那句话会让用户以为白点了一次。
+        let plan;
+        try {
+          plan = await ipc.forkSession(engine, sessionId, anchor ?? null);
+        } catch (error) {
+          // 说明**是哪件事**失败了：只丢一句原始错误，用户不知道这是分叉出错
+          // （可能是定位不到该轮、来源文件被外部改过等）。
+          set({ actionError: i18n.t("chat.forkFailed", { reason: errorText(error) }) });
+          return;
+        }
         // 分支的 `sessions` 行是后端按**来源会话的工作区**写的，页签必须跟着它，
         // 否则来源是从搜索/插件等入口打开、调用方工作区与它不一致时，分支首轮
         // 会以别的 cwd 启动——而引擎按 cwd 解析转录本，`--resume` 可能找不到
@@ -553,7 +568,7 @@ export function createSessionActions(
             sessionId: plan.targetSessionId,
             workspacePath: branchWorkspace,
           };
-          // 已经开过这个分支就不重复插入（重复点击 / 双窗口）。
+          // 已经开过这个分支就不重复插入（重复点击）。
           const openTabs = s.openTabs.some((t) =>
             sameTab(t, tab.engine, tab.sessionId, branchWorkspace),
           )
@@ -565,11 +580,16 @@ export function createSessionActions(
         // 立刻把继承过来的历史读进时间线：分支页签要**马上**显示分叉点之前的
         // 对话，而不是等用户切走再切回来。会话激活广播由 selectSession 发出
         // （tabs.ts 的 activateTab 也走同一条路径），这里不再补发第二次。
-        await get().selectSession(plan.sourceEngine, plan.targetSessionId, branchWorkspace);
-      } catch (error) {
-        // 说明**是哪件事**失败了：只丢一句原始错误，用户不知道这是分叉出错
-        // （可能是定位不到该轮、来源文件被外部改过等）。
-        set({ actionError: i18n.t("chat.forkFailed", { reason: errorText(error) }) });
+        //
+        // 这一步失败时分支已经建好、页签也已插入，所以**不**报"创建分支失败"：
+        // 让 `selectSession` 自己的错误通道处理（它会把 error 挂到会话上、界面
+        // 显示读取失败并给重试）。这里只留一条日志，便于区分"分叉没成功"和
+        // "分叉成功但历史没读进来"。
+        try {
+          await get().selectSession(plan.sourceEngine, plan.targetSessionId, branchWorkspace);
+        } catch (error) {
+          console.error("[fork] 分支已创建，但读取历史失败", error);
+        }
       } finally {
         // 失败也要清，否则入口会永远停在"进行中"。
         set((s) => {

@@ -1472,6 +1472,34 @@ describe("forkSession", () => {
     expect(s.active?.sessionId).toBe(SRC);
   });
 
+  it("does not report a fork failure when only reading the branch history fails", async () => {
+    // 分叉本身已经成功（分支文件 + sessions 行都落地了），只有后续"把历史读进
+    // 时间线"失败。这时报「创建分支失败」会让用户以为白点了一次，而分支其实
+    // 已经存在、页签也开好了。
+    useChatStore.setState({
+      openTabs: [{ engine: "claude", sessionId: SRC, workspacePath: WS }],
+      active: { engine: "claude", sessionId: SRC, workspacePath: WS },
+      actionError: null,
+      bySession: {},
+      forkingByKey: {},
+    });
+    const selectSpy = vi
+      .spyOn(useChatStore.getState(), "selectSession")
+      .mockRejectedValueOnce(new Error("read failed"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await useChatStore.getState().forkSession("claude", SRC, WS);
+
+    const s = useChatStore.getState();
+    expect(s.actionError).toBeFalsy();
+    // 分支页签已经在了 —— 证明分叉确实成功。
+    expect(s.openTabs.some((t) => t.sessionId === "target-session")).toBe(true);
+    // 防重入标记也要清掉，否则入口永远停在"进行中"。
+    expect(s.forkingByKey[`claude/${SRC}`]).toBeUndefined();
+    selectSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
   it("ignores a second fork of the same session while the first is in flight", async () => {
     vi.mocked(ipc.forkSession).mockClear();
     let releaseFork!: (plan: ForkPlan) => void;
