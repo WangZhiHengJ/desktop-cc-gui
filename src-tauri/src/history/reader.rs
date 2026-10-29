@@ -98,6 +98,8 @@ pub async fn list_sessions(
     tauri::async_runtime::spawn_blocking(move || list_sessions_from(&db))
         .await
         .map_err(|e| e.to_string())?
+}
+
 /// 单个会话的元信息（与 `list_sessions` 同一套 JOIN 与行映射，只是按
 /// `(engine, session_id)` 收口）。会话分叉需要它来拿源会话的 `file_path`
 /// 与标题，而不必把整个目录列出来。
