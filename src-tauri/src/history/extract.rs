@@ -97,7 +97,7 @@ pub(super) enum ImageMode {
 
 type LineExtractor<'a> = Box<dyn Fn(&Value) -> LineRows + 'a>;
 
-pub(super) fn extractor_for(engine: &str, images: ImageMode) -> LineExtractor<'static> {
+fn extractor_for(engine: &str, images: ImageMode) -> LineExtractor<'static> {
     if engine == "dsh" {
         Box::new(extract_dsh_line)
     } else if engine == "codebuddy" {
@@ -215,10 +215,10 @@ fn walk_lines(
             continue;
         };
         for row in extract(&value) {
-            let Some(mut row) = normalize_extracted_row(row, accepted_internal_frames) else {
+            let Some(row) = normalize_extracted_row(row, accepted_internal_frames) else {
                 continue;
             };
-            row.line = line;
+
             consume(line, row);
         }
     }
@@ -665,9 +665,6 @@ fn text_of_parts(parts: &[Value], typed_only: bool, sep: &str) -> String {
 
 /// One extracted row from a native session line.
 struct LineRow {
-    /// 该 row 来自文件第几行（0 起）；由 `walk_lines` 统一填。一条记录可能产出
-    /// 多行 row，它们都算在同一行上——分叉的切点是行级前缀，只看这条记录在哪。
-    line: usize,
     role: String,
     text: String,
     ts: Option<String>,
@@ -687,7 +684,7 @@ impl LineRow {
     /// A plain row without usage/model metadata.
     fn new(role: &str, text: String, ts: Option<String>) -> Self {
         Self {
-            line: 0,
+
             role: role.to_string(),
             text,
             ts,

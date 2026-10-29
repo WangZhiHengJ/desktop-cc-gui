@@ -534,9 +534,11 @@ export function createSessionActions(
       // 各自分配标题编号，用户拿到两条看起来一样的会话。同一来源会话在飞期间，
       // 后续点击直接丢弃；入口据此置灰成"进行中"。
       //
-      // 注意范围：`forkingByKey` 是**本窗口**的 store 状态。它挡的是同一个渲染进程
-      // 里的重复点击，**挡不住**另一个窗口/第二个渲染进程同时分叉（那属于后端
-      // 编号查重的职责，最终仍只有一个分支拿到 `#1`，另一个是 `#2`）。
+      // 注意范围：`forkingByKey` 是**本窗口**的 store 状态，只挡同一个渲染进程里的
+      // 重复点击。以下两种情况它挡不住：① 局域网网页客户端与桌面端同时分叉（两边驱动
+      // 同一个进程）；② 同一个数据目录跑起两个进程（应用没有单实例锁）。此时后端可能
+      // 给两条分支取到**同一个** `#N`——编号是「读标题快照 → 之后才写」两步，并发无原子性。
+      // 这个窗口很窄（正常不会同时开两个客户端），先如实记录，真遇到再治理。
       if (get().forkingByKey[key]) return;
       set((s) => ({ forkingByKey: { ...s.forkingByKey, [key]: true } }));
       try {
@@ -562,6 +564,16 @@ export function createSessionActions(
         // 会以别的 cwd 启动——而引擎按 cwd 解析转录本，`--resume` 可能找不到
         // 刚写好的分支文件。旧后端不返回该字段时回退到调用方工作区。
         const branchWorkspace = plan.workspacePath ?? workspacePath;
+        // 降级要**说出来**：分支已经建好，但链路最后一步（继承原会话的模型 / 思考
+        // 档位 / 供应商）有失败项时，分支首轮会用引擎默认值。后端只打日志，打包后
+        // 的 GUI 没有控制台，不说用户就永远不知道——他只会觉得"分支怎么换了模型"。
+        if (plan.degraded && plan.degraded.length > 0) {
+          set({
+            actionError: i18n.t("chat.forkDegraded", {
+              items: plan.degraded.map((item) => i18n.t(`chat.forkDegradedItem.${item}`)).join("、"),
+            }),
+          });
+        }
         set((s) => {
           const tab: ActiveSession = {
             engine: plan.sourceEngine,
