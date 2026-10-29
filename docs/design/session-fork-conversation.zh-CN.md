@@ -8,9 +8,9 @@
 > | # | 决策 | 出处 |
 > |---|---|---|
 > | 1 | ~~**惰性落地**~~ → **v7 改为「点击即落盘」**：点「创建分支」时后端就把继承的前缀转录本写好并登记 `sessions` 行，分支页签**立刻**显示分叉点之前的全部对话。不需要真发消息、不花 token、不多轮次（文件是我们自己写的）。 | §2.3 |
-> | 2 | **操作区可见性**：复制、分支**常驻**；元信息（时间/耗时/tokens/模型/推理档位）保持 hover 显形；**流式期间保留占位 + 禁用** | §4.3.1 |
+> | 2 | **操作区可见性**：**助手回复**下方复制、分支**常驻**；**用户气泡只有复制**且保持 hover / `focus-visible` 显形，**不放分叉入口**；元信息（时间/耗时/tokens/模型/推理档位）保持 hover 显形；**流式期间保留占位 + 禁用** | §4.3.1 |
 > | 3 | **图标用 `lucide-react` 的 `GitFork`**（不用 `GitBranch`，避免与状态栏 git 分支切换器混淆） | §4.3.1 |
-> | 4 | **user 气泡侧同步常驻**（复制 + 分支） | §4.3.1 |
+> | 4 | **user 气泡侧不常驻、也没有分叉入口**（只保留 hover 复制；分叉按「轮」定位，与同轮回复指向同一点，留一处即可） | §4.3.1 |
 >
 > **v4 关键变更（依据需求澄清 + 补充实测）**
 > 1. ~~**分叉是"惰性"的**~~ → **v7 改为点击即落盘**。当时观测到 `--fork-session` 不发送就不产生文件，于是推测分叉只能等到首条消息；后来改用**自己写前缀转录本**，不必依赖引擎原生 fork，也就不必等发送。发出时落地 —— **没有浪费的轮次**。
@@ -105,7 +105,7 @@
 
 | 机制 | 适用 | 实测 | 评价 |
 |---|---|---|---|
-| **(A) 原生分叉** | 两个引擎都支持 | #1、#12–#15 | ❌ **已否决（v7）**：原生 fork 与"点击即落盘"冲突——它要等到发第一条消息才产生文件，且 dsh 根本没有 `session/fork` 接口 |
+| **(A) 原生分叉** | Claude / Codex 支持，dsh 无此设施 | #1、#12–#15 | ❌ **已否决（v7）**：原生 fork 与"点击即落盘"冲突——它要等到发第一条消息才产生文件，且 dsh 根本没有 `session/fork` 接口 |
 | (B) 复制前缀 | 通用后备 | #3、#5、#6、#7 | 保留为后备；实测也完全可用 |
 
 **为什么 (A) 更优**：它把"转录本格式"这个最容易随 CLI 版本漂移的东西**交还给引擎自己**。方案不再依赖我们对 `.jsonl` 字段的理解是否正确。
@@ -127,7 +127,7 @@
 v4–v6 的分支页签点开是一片空白，与意图直接冲突——这在真机验收里被判定为错误。
 
 **分叉点包含用户点的那一轮**（v7 修正）：点「请教一个数学题」这一轮 → 分支里有这一轮 + 之前全部。
-两个引擎的切点都按"该轮结束、下一轮开始"取：
+三个引擎的切点都按"该轮结束、下一轮开始"取（**每条判据都与解析器同源**，见下）：
 - Claude：切在**下一个**可见 user 记录之前（锚点轮是最后一轮则保留整份文件）。
 - Codex：保留"锚点轮及之前"的完整轮（切在锚点轮 `task_complete` 之后）；锚点轮还没定稿就明确报错。
 
@@ -138,6 +138,20 @@ v4–v6 的分支页签点开是一片空白，与意图直接冲突——这在
 **代价**：点了不发会留下一个真实会话文件（多一条侧栏记录）。这是"立刻看到上下文"的必要代价，
 且它内容完整、可随时删除，不属于垃圾数据。
 
+### 3.5 dsh：切在 `turn/end` 之后（第三引擎）
+
+dsh 的转录本是**多帧 zstd**（`<dsh home>/sessions/<cwd-slug>/session-<uuid>/session.v<N>.jsonl.zstd`），
+所以它的落盘形状与两个明文引擎整条都不同，实现单独放在 `engine/fork_dsh.rs`（能力表里一行
+`DSH_FORK` 指向它）：
+
+- **来源 id**：`session-<uuid>`（目录名 = 转录本 header 的 `id`）；分支 id 同样带前缀。
+- **切点**：锚点轮的**第一个 `turn/end`**（含该行）。dsh 一轮里可以有多条可见 user 消息，
+  所以**按锚点行号往后找轮尾**，不能"数第几轮的 turn/end"。
+- **锚点定位**同样走 `user_row_lines("dsh", …)`：自己拿 `dsh_user_message_text` 数原始行会
+  把注入块/内部帧算成用户消息，切点提前一轮。
+- **没有 `turn/end`** 时明确报错，不退化成"从末尾分叉"。
+- **回滚**要连目录一起删（分支是"目录 + 转录本"，只删文件会留下空目录占住那个
+  `session-<uuid>`），所以能力表里 `cleanup` 指向 `remove_written_transcript_and_dir`。
 > 相关：`--fork-session`（Claude）与 `thread/fork`（Codex）这两个**原生**设施**不再用于分叉落地**
 > ——两个引擎统一走"自己裁前缀"。实测数据（#1/#3/#12）仍然有效，只是不再是主路径。
 
@@ -274,7 +288,7 @@ pub struct ForkAnchor {
 
 ## 4. 实现方案
 
-### 4.1 后端：`src-tauri/src/engine/fork.rs`
+### 4.1 后端：`src-tauri/src/engine/fork/`（mod / anchor / title / landing）
 
 ```rust
 #[tauri::command]
@@ -323,8 +337,11 @@ pub async fn fork_session(
 
 | 位置 | 动作 |
 |---|---|
-| `src-tauri/src/engine/fork.rs` | 新模块（引擎无关的主流程 + 能力表） |
-| `src-tauri/src/lib.rs:474-492` | 注册进 `invoke_handler` |
+| `src-tauri/src/engine/fork/mod.rs` | 新模块：引擎无关的主流程（`fork_session` / `resolve_fork_plan`）+ 能力表 `FORK_SUPPORT` |
+| `src-tauri/src/engine/fork/anchor.rs` | 锚点与切点：`ForkAnchor`、`text_sha256_hex`、`anchor_turn`、两个 `fork_keep_count*` |
+| `src-tauri/src/engine/fork/title.rs` | 分支标题编号、堆叠与长度上限 |
+| `src-tauri/src/engine/fork/landing.rs` | 落盘与登记：前缀复制、身份改写、`register_fork_landing_with_path`、失败回滚 |
+| src-tauri/src/lib.rs:474-492 | 注册进 invoke_handler |
 | `src-tauri/src/web/dispatch.rs:768-860` | 加 `"fork_session"` 分支 + args 结构体。**网页模式走这条通道，漏了只有桌面端能用** |
 | `src/lib/ipc.ts`（约 `1546`） | `forkSession` wrapper + 类型（对照 `deleteSession`） |
 
@@ -335,7 +352,7 @@ pub async fn fork_session(
 已核实：每消息操作**只有复制按钮**，无右键菜单、无通用 edit/retry（唯一的 per-message 重发是权限卡 `GrantCard.tsx:62`，其 disabled/loading 视觉可借鉴）。
 
 - **签名现实**：`MessageActions` 入参是 `{ text }: { text: string }`（`:223`），**拿不到 message**；`UserMessageCopy` 同样（`:252`，`:255` 空文本早退）。要让按钮知道"点的是哪条消息"，必须补参数。
-- 入口：两者各加一个 `GitFork` 图标按钮（**不是** `GitBranch`，理由见 §4.3.1），复用 `iconBtn` 规格（`size-6`）。
+- 入口：**只加在助手回复的操作行**（`MessageActions`）。用户气泡**不加**分叉入口——分叉按「轮」定位，用户气泡与同轮回复指向同一个分叉点，两侧都放会让图标密度翻倍而信息量为零（**不是** `GitBranch`，理由见 §4.3.1），复用 `iconBtn` 规格（`size-6`）。
 - ⚠️ **不要放宽 `turnFinal` 守卫**：`368-378` 的守卫同时包住 `MessageActions` **和 `MessageMeta`**，而 `turnFinal` 在整个流式窗口为 false（`:107` 还有 `&& !turnLive`）。整体放宽会让「时间/用量/模型」出现在**仍在增长**的回复上。→ 按 §4.3.1 拆成"常驻行 + hover 元信息"。
 - 分叉点构造：按 §3.3 先取**该轮的用户消息**，用**store 里的原始 `message.text`**算 hash（**不是** `UserMessageRow` 渲染的 `stripped.text`，`:327`）。
 - 交互：点击 → 调 `forkSession` → 成功后新会话以新 tab 打开 → 用户在该 tab 继续。失败 → 见下"错误呈现"。
@@ -366,7 +383,7 @@ pub async fn fork_session(
 
 - 整行**始终渲染**；流式期间两个按钮以 `disabled`（`opacity-50 cursor-not-allowed`）呈现，`turnLive` 结束后变可用。
 - 理由：① 避免回复结束时多出一行的布局跳动；② **语义正确**——回复还在增长时复制会拿到半句话，"看得见但明确不可用"比"藏起来"更诚实；③ 复用 `GrantCard.tsx:165-173` 的既有禁用视觉。
-- 按 `ui-ux-spec.zh-CN.md:84`：**若**该禁用需要解释文案，必须用 `aria-disabled` + 点击守卫（原生 `disabled` 收不到 hover/focus，解释性 tooltip 读不到）。本处禁用原因自明、**不加 tooltip**，因此用原生 `disabled` 属合规；一旦将来要加提示，必须改成 `aria-disabled`。
+- 按 `ui-ux-spec.zh-CN.md` §3「前置条件未满足的禁用」：**若**该禁用需要解释文案，必须用 `aria-disabled` + 点击守卫（原生 `disabled` 收不到 hover/focus，解释性 tooltip 读不到）。本处禁用原因自明、**不加 tooltip**，因此用原生 `disabled` 属合规；一旦将来要加提示，必须改成 `aria-disabled`。
 
 **图标：分叉用 `lucide-react` 的 `GitFork`，不用 `GitBranch`**
 
@@ -375,7 +392,7 @@ pub async fn fork_session(
 
 **可达性（顺带修掉既有违规）**：现状 `MessageActions`（`:229`）与 `UserMessageCopy`（`:262`）只靠 `group-hover` 显形，**没有 `focus-visible` 兜底** → 键盘/读屏用户无法触达「复制」，违反 `ui-ux-spec.zh-CN.md:80`（"可交互元素至少实现：默认 / hover / `focus-visible`（`ring-border-focus-ring`）/ active / disabled"）。常驻化后可见性问题自然消失；仍需为按钮补 `focus-visible` 焦点环。
 
-**user 气泡侧同步常驻**：`UserMessageCopy`（气泡下方，`:330`）改为常驻，两侧一致（其 `:255` 空文本守卫已处理纯图片消息）。
+**user 气泡侧不放分叉入口，复制也不常驻**：保留改动前的 hover / `focus-visible` 显形即可（其 `:255` 空文本守卫继续负责纯图片消息）。理由见 §3 的分叉规则块：分叉语义按「轮」定位，用户气泡与同轮回复指向同一个分叉点，只留助手侧一处。
 
 **复制反馈**：复用 `useCopied`（`src/hooks/use-copied.ts`，成功后 `Check` + **1500ms** 复位）；按 `ui-ux-spec:224`，可访问名一并改为"已复制"。
 
