@@ -75,8 +75,9 @@ export function resolveForkAnchor(
   // 分支要**包含**用户点的那一轮（点「请教一个数学题」→ 分支里有这一轮 +
   // 之前全部）。若从 `from - 1` 起扫，点用户气泡会退到上一轮结束，把用户刚点
   // 的那一轮排除掉——与点同一轮的助手回复给出不同结果，是错的。
-  // `indexOf` 未命中时用 length（从末尾开始扫），后面按 `row === undefined`
-  // 收口——空列表与"消息不在集合里"都必须安全返回 null。
+  // `indexOf` 未命中（含"这条消息不在 neighbors 里"）时从 length 起扫：第一轮取到的
+  // 就是 `neighbors[length] === undefined`，立刻被下面的 `!row` 收口成 null。所以未命中
+  // **不会**退化成"从末尾分叉"，空列表与不在集合里都安全返回 null。
   const from = end >= 0 ? end : neighbors.length;
   for (let i = from; i >= 0; i -= 1) {
     const row = neighbors[i];
@@ -92,30 +93,61 @@ export function resolveForkAnchor(
   return null;
 }
 
-/** 一条消息的分叉锚点：该轮用户消息的原始文本与 seq（见 `resolveForkAnchor`）。 */
-export type ForkAnchorTarget = { text: string; seq: number };
+/** 一条消息的分叉锚点：该轮用户消息的原始文本、seq，以及**从尾部数**的同文本序号。 */
+export type ForkAnchorTarget = { text: string; seq: number; tail: number };
 
 /**
  * 一次性算出**每条消息**的锚点（用户行取自己，之后的行取最近的前一条用户行）。
  *
  * 为什么不再逐行调 `resolveForkAnchor`：那样每行都要对自己的 `neighbors` 做一次
- * `indexOf`，长列表里是 O(n²)；更糟的是 `neighbors` 只能是 `session.messages`，
- * 而它在**每次流式 flush 时都是新数组**——把它当 prop 传给每行，行级 `memo`
- * 就全部失效（`timeline-rows.ts` 的 WeakMap 行缓存因此白做），所有可见行每次
- * flush 都重渲染。改成在这里一趟算完、每行只拿到自己的 `{text, seq}` 之后，
- * 行组件收到的是**稳定的原始值**，未变化的行可以直接跳过。
+ * `indexOf`，长列表里是 O(n²)。改成在这里一趟算完（O(n)），每行只拿自己那一份。
  *
- * 复杂度：O(n)（只扫一遍，用户行即当前锚点）。
+ * ⚠️ **锚点对象必须跨 render 复用**：`forkAnchor` 是行组件（`memo` 默认浅比较）的
+ * prop，如果每次算 map 都新建 `{text, seq}` 字面量，那么引用每轮都变——行级 `memo`
+ * 就白做了（和当初直接把 `session.messages` 传下去是同一个后果）。所以按消息引用
+ * 缓存一份，内容没变就返回同一个对象。`timeline-rows.ts` 的行缓存也依赖同一前提。
+ *
+ * **`tail` 是消歧的关键**：连发多条相同文本（「继续」×3）时，后端不能只靠 seq 判断
+ * 用户点的是哪一条——前端的 seq 是本地累加的（卡片行也占号），与后端重新编号的 seq
+ * 不同源，漂移一两格就会把「中间那条」判成最后一条（真机复现过）。`tail` 只数
+ * "这条之后还有几条同样文本"，与编号无关；而前端窗口**总是转录本的尾部**（历史是
+ * 往前插页），所以两边数出来一致。
+ *
+ * 复杂度：O(n)（倒序数 tail 一趟 + 正序分发一趟）。
  */
+
+/** 按消息引用缓存锚点对象：`text` / `seq` / `tail` 不变就复用同一个引用。 */
+const forkAnchorCache = new WeakMap<Message, ForkAnchorTarget>();
+
+function anchorOfUserRow(row: Message, tail: number): ForkAnchorTarget {
+  const cached = forkAnchorCache.get(row);
+  if (cached && cached.text === row.text && cached.seq === row.seq && cached.tail === tail) {
+    return cached;
+  }
+  const next: ForkAnchorTarget = { text: row.text, seq: row.seq, tail };
+  forkAnchorCache.set(row, next);
+  return next;
+}
+
 export function resolveForkAnchors(
   neighbors: readonly Message[],
 ): ReadonlyMap<Message, ForkAnchorTarget> {
+  // 先倒序数「这条之后还有几条同文本」：从尾部开始，同文本的计数只增不清。
+  const tailOf = new Map<Message, number>();
+  const seen = new Map<string, number>();
+  for (let i = neighbors.length - 1; i >= 0; i -= 1) {
+    const row = neighbors[i];
+    if (row.role !== "user") continue;
+    const tail = seen.get(row.text) ?? 0;
+    tailOf.set(row, tail);
+    seen.set(row.text, tail + 1);
+  }
   const anchors = new Map<Message, ForkAnchorTarget>();
   let current: ForkAnchorTarget | null = null;
   for (const row of neighbors) {
     // 卡片行（授权 / 问答 / 计划）不是对话轮次：`continue` 而不是清空 `current`，
     // 它们夹在轮次中间，不该切断已有锚点。
-    if (row.role === "user") current = { text: row.text, seq: row.seq };
+    if (row.role === "user") current = anchorOfUserRow(row, tailOf.get(row) ?? 0);
     if (current) anchors.set(row, current);
   }
   return anchors;
@@ -133,6 +165,7 @@ const TimelineRowView = memo(function TimelineRowView({
   row,
   workspacePath,
   turnLive,
+  turnStartSeq,
   autoExpand,
   answered,
   thinkingAutoCollapse,
@@ -146,6 +179,8 @@ const TimelineRowView = memo(function TimelineRowView({
   workspacePath: string;
   /** True while the current turn is still streaming; suppresses the footer. */
   turnLive: boolean;
+  /** 当前这一轮起点用户消息的 seq（`null` = 不按轮次区分）。 */
+  turnStartSeq: number | null;
   /** True on the timeline's last process row: it opens on arrival and rides
    * the live tail; a thinking run may still fold once answer text follows it
    * or the turn ends. */
@@ -205,6 +240,7 @@ const TimelineRowView = memo(function TimelineRowView({
       workspacePath={workspacePath}
       turnFinal={row.turnFinal && !turnLive}
       turnLive={turnLive}
+      turnStartSeq={turnStartSeq}
       sessionRemote={sessionRemote}
       forkPending={forkPending}
       forkAnchor={forkAnchor}
@@ -338,13 +374,19 @@ const ICON_BTN_BUSY = "disabled:cursor-wait disabled:opacity-70";
 const ICON_BTN_FROZEN =
   "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-foreground-icon-secondary";
 
-/** 复制按钮（两侧共用）。 */
+/** 复制按钮（两侧共用）。
+ *
+ *  `disabled` 只用于**流式期间**：回复还在增长时点复制只能拿到半句话，而复制成功
+ *  会立刻把按钮切成「已复制」——用户以为复制到了完整内容（ui-ux-spec §3「流式期间
+ *  保留占位 + 禁用」）。这类原因自明，用原生 `disabled` 即可，不加 tooltip。 */
 function CopyButton({
   text,
   className = "",
+  disabled = false,
 }: {
   text: string;
   className?: string;
+  disabled?: boolean;
 }) {
   const { t } = useTranslation();
   const { copied, copy } = useCopied();
@@ -354,8 +396,9 @@ function CopyButton({
       // ui-ux-spec §4.2：复制没有别的成功信号，可访问名一起改成「已复制」。
       aria-label={copied ? t("chat.copied") : t("chat.copy")}
       title={copied ? t("chat.copied") : t("chat.copy")}
+      disabled={disabled}
       onClick={() => copy(text)}
-      className={`${ICON_BTN} message-copy-btn ${className}`}
+      className={`${ICON_BTN} ${ICON_BTN_FROZEN} message-copy-btn ${className}`}
     >
       {copied ? (
         <Check className="size-3.5 text-lime-500" aria-hidden />
@@ -366,7 +409,7 @@ function CopyButton({
   );
 }
 
-/** 创建分支按钮（两侧共用）。可见性由调用方给（「这条消息能否当分叉锚点」），
+/** 创建分支按钮（**只出现在助手回复下方**；用户气泡没有入口，见 `UserCopyActions`）。可见性由调用方给（「这条消息能否当分叉锚点」），
  *  不可用时**保留占位**：流式期间禁用而非隐藏，看得见但明确不可用比凭空消失
  *  更诚实，也避免回复结束时多出一行的布局跳动（ui-ux-spec §3）。
  *
@@ -423,11 +466,14 @@ function ForkButton({
 /** Assistant message actions: copy + fork, both always visible. */
 function MessageActions({
   text,
+  live,
   showFork,
   forkUnavailable,
   onFork,
 }: {
   text: string;
+  /** 本轮还在流式：复制与分叉**一起**禁用（规范要求两个按钮同源），避免复制到半句话。 */
+  live: boolean;
   /** 这条消息能当分叉锚点（入口常驻）；不能时只撤掉分支按钮，复制仍在。 */
   showFork: boolean;
   forkUnavailable: ForkUnavailable | null;
@@ -435,33 +481,29 @@ function MessageActions({
 }) {
   return (
     <div className="flex items-center gap-0.5">
-      <CopyButton text={text} />
+      <CopyButton text={text} disabled={live} />
       {showFork && <ForkButton unavailable={forkUnavailable} onFork={onFork} />}
     </div>
   );
 }
 
-/** Copy + fork affordance for a user bubble: icon only, no chrome, in a footer
- *  row under the bubble's bottom-right corner. A side-slot button vertically
- *  centers against the bubble, so long messages push it far from the text
- *  it copies; a footer stays put regardless of bubble height. Always visible
- *  (design §4.3.1) and keyboard reachable. */
-function UserMessageActions({
-  text,
-  showFork,
-  forkUnavailable,
-  onFork,
-}: {
-  text: string;
-  showFork: boolean;
-  forkUnavailable: ForkUnavailable | null;
-  onFork: () => void;
-}) {
-  if (!text.trim() && !showFork) return null;
+/** 用户气泡的复制入口：**hover / 聚焦时出现**，不常驻。
+ *
+ *  用户气泡上刻意**没有**分叉入口：实际使用中创建分支几乎都是基于助手回复发起的
+ *  （「这一轮答得不错，从这儿分个支」），用户气泡常驻一组图标只会让长对话更密。
+ *  分叉入口只出现在助手消息下方，并常驻（可 Tab 聚焦），见 `MessageActions`。
+ *
+ *  复制保留：它是气泡上唯一有用的动作，沿用改动前的 hover 形态
+ *  （`opacity-0 group-hover:opacity-100 focus-visible:opacity-100`）——
+ *  `focus-visible` 一并点亮，键盘用户 Tab 到时才看得见。 */
+function UserCopyActions({ text }: { text: string }) {
+  if (!text.trim()) return null;
   return (
     <div className="mt-0.5 flex items-center gap-0.5">
-      {text.trim() && <CopyButton text={text} />}
-      {showFork && <ForkButton unavailable={forkUnavailable} onFork={onFork} />}
+      <CopyButton
+        text={text}
+        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+      />
     </div>
   );
 }
@@ -504,17 +546,7 @@ function AgentBadge({
 /** User bubble. The agent block sendPrompt appended stays in history (the
  *  CLI transcript owns it), but the bubble strips it and carries the agent
  *  identity as a small badge above, mirroring the meta row's caption type. */
-function UserMessageRow({
-  message,
-  showFork,
-  forkUnavailable,
-  onFork,
-}: {
-  message: Message;
-  showFork: boolean;
-  forkUnavailable: ForkUnavailable | null;
-  onFork: () => void;
-}) {
+function UserMessageRow({ message }: { message: Message }) {
   const stripped = useMemo(() => stripAgentBlock(message.text), [message.text]);
   return (
     <div className="group -mr-1.5 ml-auto flex w-full min-w-0 flex-col items-end">
@@ -533,14 +565,12 @@ function UserMessageRow({
           {stripped.text}
         </CollapsibleMessage>
       </div>
-      {/* 复制用 store 的原始文本，不是 strip 后的显示文本——两者在带 agent
-          区块时不同，而复制按钮一直复制的是显示文本，这里保持原样。 */}
-      <UserMessageActions
-        text={stripped.text}
-        showFork={showFork}
-        forkUnavailable={forkUnavailable}
-        onFork={onFork}
-      />
+      {/* 复制用 strip 之后的**显示文本**（`stripped.text`），与改动前的 UserMessageCopy
+          一致；而分叉锚点用 `message.text` 原文——后端要拿它算 sha256 与转录本比对，
+          转录本里含 sendPrompt 追加的 agent 区块。两者**故意不同源，不要"统一"**：
+          改成原文复制会让用户把 agent 区块一起复制走，改成 strip 文本做锚点则后端
+          定位不到该轮。用户气泡只有复制（hover 出现），没有分叉入口。 */}
+      <UserCopyActions text={stripped.text} />
     </div>
   );
 }
@@ -551,6 +581,7 @@ export const MessageRow = memo(function MessageRow({
   turnFinal,
   forkAnchor,
   turnLive = false,
+  turnStartSeq = null,
   sessionRemote = false,
   forkPending = false,
 }: {
@@ -562,6 +593,8 @@ export const MessageRow = memo(function MessageRow({
   forkAnchor?: ForkAnchorTarget | null;
   /** 本轮还在流式：分叉入口保留占位但禁用。 */
   turnLive?: boolean;
+  /** 当前这一轮起点那条用户消息的 seq；`null` = 不区分轮次（只认 `message.live`）。 */
+  turnStartSeq?: number | null;
   /** 会话目录里的远程标记（远程会话不分叉）；由时间线取一次往下传，避免每行
    *  各自订阅会话目录、在每个流式 flush 里重扫一遍。 */
   sessionRemote?: boolean;
@@ -580,11 +613,13 @@ export const MessageRow = memo(function MessageRow({
   const scoped = useScopedSession();
   const forkSession = useChatStore((s) => s.forkSession);
   const requestFork = useCallback(
-    (anchorText: string, seqHint: number) => {
+    (anchorText: string, seqHint: number, tailOccurrence: number) => {
       if (!scoped?.sessionId) return;
       void forkSession(scoped.engine, scoped.sessionId, scoped.workspacePath, {
         userTextSha256: sha256Hex(anchorText),
         seqHint,
+        // 从尾部数的同文本序号：后端据此精确定位，不吃 seq 漂移。
+        tailOccurrence,
       });
     },
     [forkSession, scoped?.engine, scoped?.sessionId, scoped?.workspacePath],
@@ -603,15 +638,21 @@ export const MessageRow = memo(function MessageRow({
     // decision actions live in the dock, settled rows stay as history.
     return <PlanReviewCard message={message} workspacePath={workspacePath} />;
   }
-  // 分叉入口的**可见性**只看「这条消息能否当锚点」：用户行包含它自己那一轮
-  // （resolve-fork-anchor 的契约），所以用户气泡与同轮助手回复给出同一个分叉
-  // 点。**绝不能拿 `turnFinal` 当闸门**——它只由 buildRows 打给助手行
-  // （timeline-rows.ts 的收尾扫描），用户行恒为 false，那样用户气泡的入口永远
-  // 渲染不出来，而"每条消息都有常驻操作行"是设计约定（design §4.3.1）。
+  // 分叉入口只出现在**助手**消息下方：可见性只看「这条消息能否当锚点」
+  // （`resolveForkAnchors` 已按轮算好），与 `turnFinal` 无关——想分叉的那条回复
+  // 未必是本轮最后一段。用户气泡没有入口（见 `UserCopyActions`）。
   const forkTarget = forkAnchor ?? null;
   // 可见性只看"能否定位到这一轮"，**不**看这一轮有没有文本：纯图片轮定位得到但没有
   // 可用的文本摘要，那是"不可用"（置灰 + 说明），不是"看不见"。
   const showFork = forkTarget !== null;
+  // 「本轮还在流式」的**唯一**判据：复制与分叉共用它，避免两处各写一份而漂移
+  // （规范要求流式期间两个按钮一起禁用）。
+  // 「本轮还在流式」只对**正在输出的这一轮**成立：`turnLive` 是会话级标志（整段时间
+  // 都为 true），直接拿它判断会把**所有历史轮**的复制/分叉一起禁用——真机反馈：
+  // 回复途中，历史消息的分支与复制也点不动了。所以还要看这一行是否在最后一条用户
+  // 消息之后（即当前轮）。`message.live` 由 store 打在真正增长的那一行上，最准。
+  const inCurrentTurn = turnStartSeq != null && message.seq >= turnStartSeq;
+  const messageLive = message.live === true || (turnLive && inCurrentTurn);
   // 可见 ≠ 可用：流式期间、远程 / 不支持的引擎、纯图片轮、以及这次分叉还在飞，都只
   // 置灰（保留占位，见 ForkButton 的注释）。`scoped?.engine ?? ""` 不在白名单里，
   // 所以"没有会话可归属"时也是禁用态，而不是一颗点了没反应的活按钮。
@@ -620,21 +661,14 @@ export const MessageRow = memo(function MessageRow({
         engine: scoped?.engine ?? "",
         remote: sessionRemote,
         imageOnly: !forkTarget.text.trim(),
-        live: turnLive || message.live === true,
+        live: messageLive,
         pending: forkPending,
       })
     : null;
   const onFork = () =>
-    forkTarget && forkTarget.text.trim() && requestFork(forkTarget.text, forkTarget.seq);
+    forkTarget && forkTarget.text.trim() && requestFork(forkTarget.text, forkTarget.seq, forkTarget.tail);
   if (message.role === "user") {
-    return (
-      <UserMessageRow
-        message={message}
-        showFork={showFork}
-        forkUnavailable={forkUnavailable}
-        onFork={onFork}
-      />
-    );
+    return <UserMessageRow message={message} />;
   }
   return (
     <div className="group flex flex-col text-left">
@@ -644,6 +678,7 @@ export const MessageRow = memo(function MessageRow({
       <div className="mt-1 flex items-center gap-2">
         <MessageActions
           text={message.text}
+          live={messageLive}
           showFork={showFork}
           forkUnavailable={forkUnavailable}
           onFork={onFork}
@@ -889,7 +924,17 @@ export const MessageTimeline = memo(function MessageTimeline({
   // settles: while streaming, mid-turn segments (kimi multi-message replies)
   // are not the final word.
   const turnLive = streaming;
-  // The tail item is the turn-status indicator (or the grey compaction line).
+  // 「当前这一轮」的起点：最后一条用户消息的 seq。流式期间只有它**之后**的行属于
+  // 正在输出的那一轮，复制/分叉才该被禁用；历史轮必须保持可用（真机反馈：回复途中
+  // 历史消息的分支与复制也点不动了）。`null` = 没有用户消息可依据，退回只看
+  // `message.live`。
+  const turnStartSeq = useMemo(() => {
+    if (!streaming) return null;
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      if (items[i].role === "user") return items[i].seq;
+    }
+    return null;
+  }, [items, streaming]);  // The tail item is the turn-status indicator (or the grey compaction line).
   // A compaction keeps it mounted even between sends, so the line does not
   // blink out in the gap between the compact turn and the resume turn.
   const count = rows.length + (streaming || session.compaction ? 1 : 0);
@@ -1080,6 +1125,7 @@ export const MessageTimeline = memo(function MessageTimeline({
                     row={rows[item.index]}
                     workspacePath={workspacePath}
                     turnLive={turnLive}
+                    turnStartSeq={turnStartSeq}
                     autoExpand={
                       rowKey(rows[item.index]) === lastProcessKey ||
                       item.index === currentSearchRow

@@ -204,17 +204,18 @@ describe("user bubble copy affordance", () => {
     expect(bubble!.contains(button)).toBe(false);
   });
 
-  it("keeps the copy button always visible and keyboard-reachable", async () => {
+  it("reveals the user bubble copy button on hover and on keyboard focus", async () => {
     await act(async () => {
       root.render(
         <MessageRow message={userMessage("hello")} workspacePath="/ws" turnFinal />,
       );
     });
     const button = container.querySelector<HTMLButtonElement>("button")!;
-    // design §4.3.1：复制与分支常驻，不再靠 hover 显形——只靠 group-hover
-    // 的话键盘用户根本够不到（既有的可达性违规，已随常驻化修掉）。
-    expect(button.className).not.toContain("opacity-0");
-    expect(button.className).not.toContain("group-hover:opacity-100");
+    // 用户气泡刻意**不常驻**操作行：hover 才显形，`focus-visible` 一并点亮，
+    // 键盘 Tab 到时看得见。分叉入口不在这一侧（只出现在助手回复下方）。
+    expect(button.className).toContain("opacity-0");
+    expect(button.className).toContain("group-hover:opacity-100");
+    expect(button.className).toContain("focus-visible:opacity-100");
     // 焦点环只走 focus-visible（ui-ux-spec §3）。
     expect(button.className).toContain("focus-visible:ring-2");
   });
@@ -264,8 +265,9 @@ describe("user bubble copy affordance", () => {
   });
 });
 
-/** design §4.3.1：操作区常驻（复制 + 分支），元信息才走 hover；
- *  分支图标用 GitFork 而不是 GitBranch（状态栏 git 切换器已占用后者）。 */
+/** design §4.3.1：**助手回复**的操作区常驻（复制 + 分支），元信息才走 hover；
+ *  分支图标用 GitFork 而不是 GitBranch（状态栏 git 切换器已占用后者）。
+ *  用户气泡不常驻、也没有分叉入口（见下面的 user bubble copy affordance）。 */
 describe("assistant message actions", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -306,6 +308,54 @@ describe("assistant message actions", () => {
     expect(fork!.querySelector("line")).toBeNull();
   });
 
+  it("keeps history actions usable while only the current turn streams", async () => {
+    // 真机反馈：回复途中，**历史轮**的复制/分叉也被一起禁用了（`turnLive` 是会话级
+    // 标志）。正确语义是只有「当前正在输出的这一轮」不可操作。
+    const renderRow = async (seq: number) => {
+      await act(async () => {
+        root.render(
+          <MessageRow
+            message={{ ...reply, seq }}
+            workspacePath="/ws"
+            turnFinal={false}
+            turnLive
+            turnStartSeq={5}
+            forkAnchor={{ text: "问题", seq: 1, tail: 0 }}
+          />,
+        );
+      });
+      return container.querySelector<HTMLButtonElement>(".message-copy-btn")!;
+    };
+
+    // 历史轮（seq < 当前轮起点）：可用。
+    expect((await renderRow(2)).disabled).toBe(false);
+    // 当前轮（seq ≥ 起点）：禁用。
+    expect((await renderRow(7)).disabled).toBe(true);
+  });
+
+  it("disables copy and fork together while the turn streams", async () => {
+    // 规范（ui-ux-spec §3）：流式期间「复制 + 分叉」一起禁用。复制单独漏掉的话，
+    // 回复还在增长时点复制只能拿到半句话，而且会立刻显示「已复制」——
+    // 一个明确的成功反馈配上不完整的内容。
+    await act(async () => {
+      root.render(
+        <MessageRow
+          message={{ ...reply, live: true }}
+          workspacePath="/ws"
+          turnFinal={false}
+          forkAnchor={{ text: "问题", seq: 1, tail: 0 }}
+        />,
+      );
+    });
+    const copy = container.querySelector<HTMLButtonElement>(".message-copy-btn");
+    expect(copy).not.toBeNull();
+    expect(copy!.disabled).toBe(true);
+    expect(copy!.className).toContain("disabled:cursor-not-allowed");
+    // 分叉按钮的流式禁用由 `fork entry through the real row build` 里的
+    // 「keeps the entry present but disabled while the turn streams」覆盖；
+    // 这里不重复断言，避免受本用例未激活会话（engine 原因优先于 live）影响。
+  });
+
   it("hides the fork entry when the turn's user message is not loaded", async () => {
     // 只有助手行、没有本轮提问：宁可不给入口，也不猜分叉位置。
     await act(async () => {
@@ -324,7 +374,7 @@ describe("assistant message actions", () => {
           message={{ ...reply, ts: "2026-10-21T12:00:00.000Z" }}
           workspacePath="/ws"
           turnFinal={false}
-          forkAnchor={{ text: "问题", seq: 1 }}
+          forkAnchor={{ text: "问题", seq: 1, tail: 0 }}
         />,
       );
     });
@@ -337,10 +387,10 @@ describe("assistant message actions", () => {
 /** 分叉入口走**真实的 buildRows 路径**（不是手传 turnFinal）：可见性只看
  *  「这条消息能否当分叉锚点」。
  *
- *  这里盯的是用户气泡那一侧。`turnFinal` 只由 buildRows 的收尾扫描打给助手行
- *  （timeline-rows.ts），用户行恒为 false——一旦拿它当闸门，用户气泡的入口
- *  永远渲染不出来，而"每条消息都有常驻操作行（复制 + 分支）"是已确认的设计
- *  （design §4.3.1）。可见性与可用性也分开：不可用只置灰并说明，不隐藏。 */
+ *  入口**只出现在助手回复下方**（用户气泡没有分叉按钮）。`turnFinal` 只由
+ *  buildRows 的收尾扫描打给助手行（timeline-rows.ts），所以它不能当闸门：
+ *  想分叉的那条回复未必是本轮最后一段。可见性与可用性也分开：不可用只置灰并
+ *  说明，不隐藏（design §4.3.1）。 */
 describe("fork entry through the real row build", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -380,7 +430,7 @@ describe("fork entry through the real row build", () => {
         _engine: string,
         _sessionId: string,
         _workspacePath: string,
-        _anchor?: { userTextSha256: string; seqHint?: number } | null,
+        _anchor?: { userTextSha256: string; seqHint?: number; tailOccurrence?: number } | null,
       ) => {},
     );
     useChatStore.setState({ forkSession });
@@ -400,22 +450,19 @@ describe("fork entry through the real row build", () => {
     });
   }
 
-  /** 用户气泡所在的那一行（气泡与它的操作行是同一个容器里的兄弟节点）。 */
-  function userForkButton(): HTMLButtonElement {
-    const bubble = container.querySelector<HTMLElement>(".bg-bubble-user");
-    expect(bubble).not.toBeNull();
-    const fork = bubble!.parentElement!.querySelector<HTMLButtonElement>(
-      ".message-fork-btn",
-    );
-    expect(fork).not.toBeNull();
-    return fork!;
+  /** 分叉入口**只出现在助手回复下方**（用户气泡没有入口）：整条时间线里
+   *  `.message-fork-btn` 应当恰好只有回复那一颗。 */
+  function replyForkButton(): HTMLButtonElement {
+    const buttons = container.querySelectorAll<HTMLButtonElement>(".message-fork-btn");
+    expect(buttons.length).toBe(1);
+    return buttons[0];
   }
 
-  it("offers the fork entry on the user bubble and forks at that user turn", async () => {
+  it("offers the fork entry on the assistant reply and forks at that turn", async () => {
     const forkSession = spyOnFork();
     await renderTimeline();
 
-    const fork = userForkButton();
+    const fork = replyForkButton();
     expect(fork.disabled).toBe(false);
     expect(fork.getAttribute("aria-disabled")).toBeNull();
 
@@ -426,6 +473,8 @@ describe("fork entry through the real row build", () => {
     expect(forkSession).toHaveBeenCalledWith("claude", "s-1", "/ws", {
       userTextSha256: sha256Hex("你好，你是谁"),
       seqHint: 1,
+      // 从尾部数的同文本序号：这条之后没有同样的文本 ⇒ 0。
+      tailOccurrence: 0,
     });
   });
 
@@ -433,18 +482,15 @@ describe("fork entry through the real row build", () => {
     const forkSession = spyOnFork();
     await renderTimeline(true);
 
-    const fork = userForkButton();
+    const fork = replyForkButton();
     // 流式期间**保留占位 + 禁用**而非隐藏（ui-ux-spec §3）：隐藏会在回复结束
     // 时凭空多出一行。这类禁用原因自明，用原生 disabled 即可。
     expect(fork.disabled).toBe(true);
     expect(fork.className).toContain("disabled:cursor-not-allowed");
     await act(async () => fork.click());
     expect(forkSession).not.toHaveBeenCalled();
-    // 助手侧共用同一个按钮：那里曾经把 `disabled` 写死成 `false`，禁用态根本
-    // 走不到（用户气泡与助手回复的可见性/可用性必须一致）。
-    const replyFork = container.querySelectorAll<HTMLButtonElement>(".message-fork-btn")[1];
-    expect(replyFork).not.toBeNull();
-    expect(replyFork.disabled).toBe(true);
+    // 时间线里只有回复那一颗入口；用户气泡没有分叉按钮。
+    expect(container.querySelectorAll(".message-fork-btn")).toHaveLength(1);
   });
 
   it("greys a remote session's entry with the reason, and never forks", async () => {
@@ -452,7 +498,7 @@ describe("fork entry through the real row build", () => {
     useChatStore.setState({ sessions: [{ ...TAB, remote: true } as never] });
     await renderTimeline();
 
-    const fork = userForkButton();
+    const fork = replyForkButton();
     // 解释性禁用走 aria-disabled + 点击守卫：原生 disabled 收不到 hover /
     // focus，挂在 title 上的原因就读不到（ui-ux-spec §3）。
     expect(fork.getAttribute("aria-disabled")).toBe("true");
@@ -472,7 +518,7 @@ describe("fork entry through the real row build", () => {
     });
     await renderTimeline();
 
-    const fork = userForkButton();
+    const fork = replyForkButton();
     expect(fork.getAttribute("aria-disabled")).toBe("true");
     expect(fork.getAttribute("title")).toBe(i18n.t("chat.forkUnavailableEngine"));
     await act(async () => fork.click());
@@ -484,7 +530,7 @@ describe("fork entry through the real row build", () => {
     useChatStore.setState({ forkingByKey: { "claude/s-1": true } });
     await renderTimeline();
 
-    const fork = userForkButton();
+    const fork = replyForkButton();
     // 「进行中」与「前提不满足」是两种禁用（ui-ux-spec §3）：等待态用
     // cursor-wait，不能拿它表达"你还没准备好前提"。
     expect(fork.disabled).toBe(true);
