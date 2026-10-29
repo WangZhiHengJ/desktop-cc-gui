@@ -82,7 +82,11 @@ describe("resolveForkAnchors", () => {
   it("一趟算出每条消息的锚点，与逐条调 resolveForkAnchor 等价", () => {
     const anchors = resolveForkAnchors(convo);
     for (const message of convo) {
-      expect(anchors.get(message)).toEqual(resolveForkAnchor(convo, message));
+      const got = anchors.get(message);
+      // 与逐条实现比对 text/seq（`tail` 是一趟算法额外携带的消歧信息，逐条版没有）。
+      expect(got ? { text: got.text, seq: got.seq } : null).toEqual(
+        resolveForkAnchor(convo, message),
+      );
     }
   });
 
@@ -90,7 +94,7 @@ describe("resolveForkAnchors", () => {
     const rows = [msg(1, "assistant", "开场白"), msg(2, "user", "问题")];
     const anchors = resolveForkAnchors(rows);
     expect(anchors.get(rows[0])).toBeUndefined();
-    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 2 });
+    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 2, tail: 0 });
   });
 
   it("卡片行（非 user）不切断已有锚点", () => {
@@ -101,7 +105,26 @@ describe("resolveForkAnchors", () => {
     ];
     const anchors = resolveForkAnchors(rows);
     // 卡片行与它后面的助手行都归到同一条 user 消息上。
-    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 1 });
-    expect(anchors.get(rows[2])).toEqual({ text: "问题", seq: 1 });
+    expect(anchors.get(rows[1])).toEqual({ text: "问题", seq: 1, tail: 0 });
+    expect(anchors.get(rows[2])).toEqual({ text: "问题", seq: 1, tail: 0 });
+  });
+});
+describe("resolveForkAnchors 的 tail（从尾部数的同文本序号）", () => {
+  it("连发同样文本时给出 2/1/0，供后端精确定位", () => {
+    // 真机 bug：连发三次「继续」，点中间那条分叉却拿到全部三轮。前端 seq 与后端
+    // 解析 seq 不同源，所以改由 tail 消歧（只依赖出现顺序，与编号无关）。
+    const rows = [msg(1, "user", "继续"), msg(2, "user", "继续"), msg(3, "user", "继续")];
+    const anchors = resolveForkAnchors(rows);
+    expect(anchors.get(rows[0])?.tail).toBe(2);
+    expect(anchors.get(rows[1])?.tail).toBe(1);
+    expect(anchors.get(rows[2])?.tail).toBe(0);
+  });
+
+  it("不同文本各自从 0 开始数", () => {
+    const rows = [msg(1, "user", "甲"), msg(2, "user", "乙"), msg(3, "user", "甲")];
+    const anchors = resolveForkAnchors(rows);
+    expect(anchors.get(rows[0])?.tail).toBe(1);
+    expect(anchors.get(rows[1])?.tail).toBe(0);
+    expect(anchors.get(rows[2])?.tail).toBe(0);
   });
 });

@@ -151,7 +151,7 @@ export interface ChatStore {
     engine: string,
     sessionId: string,
     workspacePath: string,
-    anchor?: { userTextSha256: string; seqHint?: number } | null,
+    anchor?: { userTextSha256: string; seqHint?: number; tailOccurrence?: number } | null,
   ) => Promise<void>;
   closeTab: (
     engine: string,

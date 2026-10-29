@@ -450,6 +450,9 @@ export interface ForkPlan {
    *  而引擎按 cwd 解析转录本，`--resume` 可能找不到分支文件。
    *  可选是为了兼容旧后端（缺省时回退到调用方工作区）。 */
   workspacePath?: string;
+  /** 已降级、但分支仍算成功的项：`model` / `effort` / `provider`。
+   *  缺省或空数组表示全部继承成功。后端返回的是**稳定代码**，文案由前端 i18n 拼。 */
+  degraded?: string[];
 }
 
 export interface ProviderSection {
@@ -1680,14 +1683,14 @@ export const ipc = {
   renameSession: (engine: string, sessionId: string, title: string) =>
     invoke<void>("rename_session", { engine, sessionId, title }),
   /** 会话分叉：**点击即落盘**——后端在这一步就把裁剪后的前缀写成分支转录本并
-   *  登记 `sessions` 行，返回的 `ForkPlan` 带着新会话 id（见 `engine/fork.rs` 与
+   *  登记 `sessions` 行，返回的 `ForkPlan` 带着新会话 id（见 `engine/fork/mod.rs` 与
    *  `docs/design/session-fork-conversation.zh-CN.md` §2.3）。
    *  分支之后的每条消息都只是**普通续接**，发送路径上没有分叉字段。
    *  `anchor` 省略即 tip 分叉（完整轮次末尾）。 */
   forkSession: (
     engine: string,
     sessionId: string,
-    anchor?: { userTextSha256: string; seqHint?: number } | null,
+    anchor?: { userTextSha256: string; seqHint?: number; tailOccurrence?: number } | null,
   ) =>
     invoke<ForkPlan>("fork_session", {
       engine,
