@@ -4,7 +4,7 @@
 //! 形状整条都不同**——转录本是**多帧 zstd**（`<dsh home>/sessions/<cwd-slug>/
 //! session-<uuid>/session.v<N>.jsonl.zstd`），明文 `BufReader::lines()` 读出来是
 //! 二进制垃圾；切点也不是"第 n 条 user 记录"（一轮里可以有好几条 `user/message`），
-//! 而是锚点轮的 `turn/end`。`fork.rs` 顶部的能力表注释就点名了这种情况：把实现
+//! 而是锚点轮的 `turn/end`。`fork/mod.rs` 顶部的能力表注释就点名了这种情况：把实现
 //! 放进新文件，表里加一行指向它。
 //!
 //! 下面这些是 dsh 磁盘格式的既有事实，别再重新推导：
@@ -32,7 +32,7 @@ const DSH_LOG_STEM: &str = "session";
 
 /// dsh 在分叉**能力表**里的那一行。
 ///
-/// 放在这里而不是 `fork.rs`：行里挂的三个函数都定义在本模块，把"能力 + 实现"
+/// 放在这里而不是 `fork/mod.rs`：行里挂的三个函数都定义在本模块，把"能力 + 实现"
 /// 留在一处，新增引擎时只需新建一个文件 + 在表里加一个名字。
 pub(crate) const DSH_FORK: super::fork::ForkSupport = super::fork::ForkSupport {
     engine: "dsh",
@@ -202,11 +202,12 @@ pub(crate) fn keep_count(
     // （`user_row_lines`）。⚠️ 不能自己拿 `dsh_user_message_text` 数原始行——那只是
     // "有没有文本"的快速判断，不经过 `normalize_extracted_row`，遇到整条都是注入块
     // 或内部帧的 `user/message` 时会多算，序号比锚点大，切点提前一轮。Codex 曾经
-    // 就是这么错的（见 `fork.rs` 的 `fork_keep_count_codex`）。
-    let anchor_line = {
+    // 就是这么错的（见 `fork/anchor.rs` 的 `fork_keep_count_codex`）。
+    let user_lines = {
         let reader = crate::history::open_line_reader("dsh", path).ok()?;
-        *crate::history::user_row_lines("dsh", reader, accepted_frames).get(anchor_user_ordinal)?
+        crate::history::user_row_lines("dsh", reader, accepted_frames)
     };
+    let anchor_line = *user_lines.get(anchor_user_ordinal)?;
     // 哨兵 `usize::MAX` 只会在锚点序号超出可见 user 条数时取到，而 `anchor_turn` 的
     // 序号一定落在范围内。
     if anchor_line == usize::MAX {
@@ -228,7 +229,13 @@ pub(crate) fn keep_count(
             continue;
         };
         if line_type(&value) == Some("turn/end") {
-            return Some(index + 1);
+            let cut = index + 1;
+            // 与 codex / Claude 对齐：锚点是最后一轮时整份文件都被搬走，返回
+            // `usize::MAX`（`at_tip`），而不是"文件全搬了但 at_tip=false"。
+            let has_later_user = user_lines
+                .iter()
+                .any(|line| *line != usize::MAX && *line > index);
+            return Some(if has_later_user { cut } else { usize::MAX });
         }
     }
     // 锚点轮没有 `turn/end`（还在跑）：不猜，报定位失败。
@@ -664,6 +671,7 @@ mod tests {
         ForkAnchor {
             user_text_sha256: super::super::fork::text_sha256_hex(text),
             seq_hint: None,
+            tail_occurrence: None,
         }
     }
 
@@ -689,8 +697,9 @@ mod tests {
         // 0 header / 1 turn1 start / 2 user / 3 assistant / 4 reminder / 5 turn1 end /
         // 6 turn2 start / 7 user / 8 子代理回报 / 9 assistant / 10 turn2 end
         assert_eq!(
-            keep, 11,
-            "切点必须含第 2 轮的 `turn/end`（第 10 行，含端点）：既不能定位失败，也不能少带/多带"
+            keep,
+            usize::MAX,
+            "锚点是最后一轮 ⇒ 整份文件都搬走（哨兵，与 Claude/Codex 对齐）；文件共 11 行，等价于切在第 10 行的 turn/end 之后"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -815,7 +824,7 @@ mod tests {
         );
         assert_eq!(
             keep_count(&source, &anchor("第二轮提问"), &messages, &frames),
-            Some(11),
+            Some(usize::MAX),
             "锚点轮 = 2 号轮：它一轮里有两条 user 记录也不影响切点"
         );
         assert_eq!(

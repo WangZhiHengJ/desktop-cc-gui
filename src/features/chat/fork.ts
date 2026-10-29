@@ -2,7 +2,7 @@
  * 会话分叉入口的可用性判定。
  *
  * 引擎白名单**只有这一份**（`FORK_ENGINES`），权威在后端的**能力表**
- * `src-tauri/src/engine/fork.rs` 的 `FORK_SUPPORT`
+ * `src-tauri/src/engine/fork/mod.rs` 的 `FORK_SUPPORT`
  * （`&[CLAUDE_FORK, CODEX_FORK, DSH_FORK]`，由 `fork_support()` 查表）——加引擎时
  * 两处必须一起改。`fork.test.ts` 有一条测试直接读后端源码比对这两份清单，漏改会红。
  *

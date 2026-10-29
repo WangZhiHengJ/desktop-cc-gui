@@ -20,8 +20,11 @@ describe("fork availability", () => {
     // 权威在后端：能力表每行都有一个 `engine: "<id>",`。前端这份是**镜像**，漏一个
     // 就会静默少一个引擎的入口——所以这里直接读后端源码比对。不这样做的话，这份
     // 清单只能靠人记得改，而它恰恰是最容易漏的一处。
+    // 权威在后端 `engine/fork/mod.rs` 的能力表（`FORK_SUPPORT` 的三行），以及
+    // `fork_dsh.rs` 里的 `DSH_FORK`。**只读这两个文件**：`fork/` 下还有测试与
+    // 其它子模块，夹具里也写着 `engine: "..."`，整目录扫会把它们算成后端引擎。
     const sources = [
-      "../../../src-tauri/src/engine/fork.rs",
+      "../../../src-tauri/src/engine/fork/mod.rs",
       "../../../src-tauri/src/engine/fork_dsh.rs",
     ]
       .map((relative) => readFileSync(new URL(relative, import.meta.url), "utf8"))
